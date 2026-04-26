@@ -45,7 +45,7 @@ async def test_user_profile_roundtrip(backend):
 async def test_soul_returns_default_when_missing(backend):
     await backend.initialize()
     soul = await backend.get_soul()
-    assert len(soul) > 0  # default text
+    assert "Atlas" in soul  # default contains the name "Atlas"
 
 
 @pytest.mark.asyncio
@@ -55,3 +55,16 @@ async def test_append_and_get_sessions(backend):
     sessions = await backend.get_recent_sessions(3)
     assert len(sessions) == 1
     assert sessions[0]["entries"][0]["user"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_search_orders_by_relevance(backend):
+    await backend.initialize()
+    await backend.write("Python is a programming language")
+    await backend.write("Python tuples are immutable sequences")
+    await backend.write("The weather is nice today")
+    results = await backend.search("Python programming")
+    assert len(results) >= 2
+    # First result should mention both Python AND programming
+    assert "Python" in results[0].content
+    assert "programming" in results[0].content

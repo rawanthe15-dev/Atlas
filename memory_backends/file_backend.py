@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from .interface import MemoryEntry, MemoryInterface
 
@@ -24,22 +25,24 @@ class FileMemoryBackend(MemoryInterface):
         if not self.user_path.exists():
             self.user_path.write_text(
                 "# User Profile\n\n## Identity\n\n## Preferences\n\n"
-                "## Projects\n\n## Patterns\n\n## Context\n"
+                "## Projects\n\n## Patterns\n\n## Context\n",
+                encoding="utf-8",
             )
         if not self.entries_path.exists():
-            self.entries_path.write_text("")
+            self.entries_path.write_text("", encoding="utf-8")
 
-    async def write(self, content: str, tags: list[str] = []) -> None:
+    async def write(self, content: str, tags: Optional[list[str]] = None) -> None:
+        tags = tags or []
         entry = {"content": content, "tags": tags, "timestamp": _utcnow()}
-        with open(self.entries_path, "a") as f:
+        with open(self.entries_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
 
     async def search(self, query: str, limit: int = 5) -> list[MemoryEntry]:
         if not self.entries_path.exists() or not self.entries_path.stat().st_size:
             return []
         query_words = set(query.lower().split())
-        scored: list[tuple[int, dict]] = []
-        with open(self.entries_path) as f:
+        scored: list[tuple[int, str, dict]] = []  # (overlap, timestamp, data)
+        with open(self.entries_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -48,11 +51,14 @@ class FileMemoryBackend(MemoryInterface):
                     data = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                content_words = set(data["content"].lower().split())
+                content = data.get("content", "")
+                if not content:
+                    continue
+                content_words = set(content.lower().split())
                 overlap = len(query_words & content_words)
                 if overlap > 0:
-                    scored.append((overlap, data))
-        scored.sort(key=lambda x: x[0], reverse=True)
+                    scored.append((overlap, data.get("timestamp", ""), data))
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
         return [
             MemoryEntry(
                 content=d["content"],
@@ -60,25 +66,25 @@ class FileMemoryBackend(MemoryInterface):
                 timestamp=d.get("timestamp", ""),
                 relevance=score / max(len(query_words), 1),
             )
-            for score, d in scored[:limit]
+            for score, _ts, d in scored[:limit]
         ]
 
     async def get_user_profile(self) -> str:
         if not self.user_path.exists():
             return ""
-        return self.user_path.read_text()
+        return self.user_path.read_text(encoding="utf-8")
 
     async def update_user_profile(self, content: str) -> None:
-        self.user_path.write_text(content)
+        self.user_path.write_text(content, encoding="utf-8")
 
     async def get_soul(self) -> str:
         if not self.soul_path.exists():
             return "You are Atlas, a powerful personal AI system. Be direct, efficient, and proactive."
-        return self.soul_path.read_text()
+        return self.soul_path.read_text(encoding="utf-8")
 
     async def append_session(self, session_id: str, entry: dict) -> None:
         session_file = self.sessions_dir / f"{session_id}.jsonl"
-        with open(session_file, "a") as f:
+        with open(session_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
 
     async def get_recent_sessions(self, n: int = 3) -> list[dict]:
@@ -88,7 +94,7 @@ class FileMemoryBackend(MemoryInterface):
         sessions = []
         for f in files:
             entries = []
-            for line in f.read_text().splitlines():
+            for line in f.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if line:
                     try:

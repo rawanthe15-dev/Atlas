@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Optional
 
 
 def _utcnow() -> str:
@@ -20,7 +21,7 @@ class MemoryInterface(ABC):
     async def initialize(self) -> None: ...
 
     @abstractmethod
-    async def write(self, content: str, tags: list[str] = []) -> None: ...
+    async def write(self, content: str, tags: Optional[list[str]] = None) -> None: ...
 
     @abstractmethod
     async def search(self, query: str, limit: int = 5) -> list[MemoryEntry]: ...
