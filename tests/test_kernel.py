@@ -97,3 +97,31 @@ async def test_memory_plugin_wires_backend(tmp_path, monkeypatch):
     await k.memory.write("test fact", tags=["test"])
     results = await k.memory.search("test fact")
     assert len(results) >= 1
+
+
+# --- Tools plugin integration test ---
+from plugins.tools_plugin import ToolsPlugin
+
+
+@pytest.mark.asyncio
+async def test_tools_plugin_loads_all_tools(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    k = Kernel()
+    k.config = {
+        "memory": {"backend": "file", "path": str(tmp_path / "memory")},
+        "tools": {"brave_api_key": "", "shell_confirm": False},
+        "openrouter": {"api_key": "", "default_model": "deepseek/deepseek-chat"},
+    }
+    await k.load_plugin(MemoryPlugin)
+    await k.load_plugin(ToolsPlugin)
+    tools_plugin = k.get_plugin("tools")
+    names = [t.name for t in tools_plugin.all()]
+    assert "shell" in names
+    assert "read_file" in names
+    assert "write_file" in names
+    assert "remember" in names
+    assert "recall" in names
+    # Verify schemas are exposed
+    schemas = tools_plugin.schemas()
+    assert len(schemas) == 6
+    assert all("function" in s for s in schemas)
