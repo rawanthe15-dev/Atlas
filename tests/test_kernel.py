@@ -79,7 +79,10 @@ from plugins.memory_plugin import MemoryPlugin
 
 @pytest.mark.asyncio
 async def test_config_plugin_sets_defaults(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+    # ConfigPlugin now uses absolute paths anchored to ATLAS_ROOT — point them
+    # at this test's tmp_path so we don't pick up the developer's real config.
+    monkeypatch.setattr("plugins.config_plugin.CONFIG_PATH", tmp_path / "config.toml")
+    monkeypatch.setattr("plugins.config_plugin.ENV_PATH", tmp_path / ".env")
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-123")
     k = Kernel()
     await k.load_plugin(ConfigPlugin)

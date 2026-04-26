@@ -11,7 +11,7 @@ from rich.rule import Rule
 from functools import partial
 
 from prompt_toolkit.application import Application
-from prompt_toolkit.application.run_in_terminal import run_in_terminal
+from prompt_toolkit.application.run_in_terminal import in_terminal
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import HTML
@@ -100,19 +100,28 @@ COMMANDS = {
 }
 
 
-# Style for the input application
+# Theme — Atlas cyan/dark aesthetic, matched across frame, toolbar, and completions
 INPUT_STYLE = Style.from_dict({
-    "frame.border":        "#5a5a5a",
-    "frame.label":         "ansicyan bold",
+    # Input frame
+    "frame.border":        "#3a4a5a",
     "input":               "",
-    "toolbar":             "#666666 italic",
-    "toolbar.accent":      "ansicyan",
+
+    # Toolbar (status bar below the frame)
+    "toolbar":             "#5a6a7a italic",
+    "toolbar.accent":      "ansicyan bold",
     "toolbar.warn":        "ansiyellow",
-    "completion-menu":                   "bg:#1a1a1a #cccccc",
-    "completion-menu.completion":        "bg:#1a1a1a #cccccc",
-    "completion-menu.completion.current": "bg:#0078d4 #ffffff bold",
-    "completion-menu.meta":              "bg:#1a1a1a #888888",
-    "completion-menu.meta.current":      "bg:#0078d4 #ffffff",
+
+    # Completion dropdown — match the dark theme
+    "completion-menu":                          "bg:#0d1620",
+    "completion-menu.completion":               "bg:#0d1620 #c0d0e0",
+    "completion-menu.completion.current":       "bg:ansicyan #000000 bold",
+    "completion-menu.meta.completion":          "bg:#0d1620 #5a7a9a italic",
+    "completion-menu.meta.completion.current":  "bg:ansicyan #1a3040 italic",
+    "completion-menu.multi-column-meta":        "bg:#0d1620 #5a7a9a",
+
+    # Scrollbar inside the dropdown
+    "scrollbar.background":  "bg:#0d1620",
+    "scrollbar.button":      "bg:#3a4a5a",
 })
 
 
@@ -188,6 +197,7 @@ class CLIPlugin(AtlasPlugin):
         self._app: Optional[Application] = None
         self._text_area: Optional[TextArea] = None
         self._processor_task: Optional[asyncio.Task] = None
+        self._current_process_task: Optional[asyncio.Task] = None  # the in-flight LLM call
         self._is_processing = False  # toolbar shows "thinking..." when True
 
     # ── favorites accessors ───────────────────────────────────────────────
@@ -287,19 +297,29 @@ class CLIPlugin(AtlasPlugin):
         n = len(agent._history) // 2
         api_set = bool(cfg.get("api_key"))
         dot = ("class:toolbar.accent", "●") if api_set else ("class:toolbar.warn", "○")
-        status = (
-            ("class:toolbar.accent", "thinking…")
-            if self._is_processing
-            else ("class:toolbar", f"{n} exchange{'s' if n != 1 else ''}")
-        )
+
+        if self._is_processing:
+            tail = [
+                ("class:toolbar.accent", "thinking…"),
+                ("class:toolbar", "  ·  press "),
+                ("class:toolbar.accent", "esc"),
+                ("class:toolbar", " to interrupt"),
+            ]
+        else:
+            tail = [
+                ("class:toolbar", f"{n} exchange{'s' if n != 1 else ''}"),
+                ("class:toolbar", "  ·  type "),
+                ("class:toolbar.accent", "/"),
+                ("class:toolbar", " for commands  ·  "),
+                ("class:toolbar.accent", "alt+enter"),
+                ("class:toolbar", " for newline"),
+            ]
+
         return [
             ("class:toolbar", "  "),
             dot,
             ("class:toolbar", f"  {model}  ·  "),
-            status,
-            ("class:toolbar", "  ·  type "),
-            ("class:toolbar.accent", "/"),
-            ("class:toolbar", " for commands"),
+            *tail,
         ]
 
     def _on_accept(self, buffer):
@@ -311,9 +331,10 @@ class CLIPlugin(AtlasPlugin):
         return False  # False keeps the app running
 
     def _build_persistent_app(self) -> Application:
-        """Build the long-lived Application that owns the input box."""
+        """Build the long-lived Application that owns the input box.
+        Multi-line: Enter submits, Alt+Enter inserts newline, Esc interrupts streaming."""
         text_area = TextArea(
-            multiline=False,
+            multiline=True,
             wrap_lines=True,
             completer=self._completer,
             history=self._history,
@@ -322,10 +343,28 @@ class CLIPlugin(AtlasPlugin):
             style="class:input",
             prompt="◈ ",
             accept_handler=self._on_accept,
+            height=Dimension(min=1, max=8, preferred=1),
         )
         self._text_area = text_area
 
         kb = KeyBindings()
+
+        # Plain Enter → submit (multiline=True doesn't do this by default)
+        @kb.add("enter")
+        def _(event):
+            event.current_buffer.validate_and_handle()
+
+        # Alt+Enter (sent as Escape+Enter on most terminals) → newline
+        @kb.add("escape", "enter")
+        def _(event):
+            text_area.buffer.insert_text("\n")
+
+        # Esc alone → interrupt current LLM call. Don't use eager=True or
+        # Esc+Enter wouldn't match. prompt_toolkit waits briefly for the next key.
+        @kb.add("escape")
+        def _(event):
+            if self._is_processing and self._current_process_task and not self._current_process_task.done():
+                self._current_process_task.cancel()
 
         @kb.add("c-d")
         def _(event):
@@ -335,7 +374,9 @@ class CLIPlugin(AtlasPlugin):
 
         @kb.add("c-c")
         def _(event):
-            if text_area.text:
+            if self._is_processing and self._current_process_task and not self._current_process_task.done():
+                self._current_process_task.cancel()
+            elif text_area.text:
                 text_area.buffer.reset()
             else:
                 self._running = False
@@ -384,7 +425,8 @@ class CLIPlugin(AtlasPlugin):
 
         if cmd == "/config":
             # Suspend live rendering so the interactive sub-prompts can take stdin
-            await run_in_terminal(self._handle_config)
+            async with in_terminal():
+                await self._handle_config()
             return True
 
         if cmd == "/memory":
@@ -413,7 +455,8 @@ class CLIPlugin(AtlasPlugin):
                 self._p(f"[green]✓ model:[/green] {arg}")
             else:
                 # Interactive picker — needs stdin, suspend live rendering
-                await run_in_terminal(self._pick_model_interactive)
+                async with in_terminal():
+                    await self._pick_model_interactive()
             return True
 
         if cmd == "/sessions":
@@ -779,14 +822,20 @@ class CLIPlugin(AtlasPlugin):
 
                 self._is_processing = True
                 self._p()
-                try:
-                    await agent.process(
+                self._current_process_task = asyncio.create_task(
+                    agent.process(
                         user_input,
                         on_token=self.stream_token,
                         on_tool_call=self.show_tool_call,
                     )
+                )
+                try:
+                    await self._current_process_task
+                except asyncio.CancelledError:
+                    self._p("\n[yellow]⎯ interrupted (esc) ⎯[/yellow]")
                 except Exception as e:
                     self._p(f"\n[bold red][error: {e}][/bold red]")
                 finally:
+                    self._current_process_task = None
                     self._is_processing = False
                 self._p()
