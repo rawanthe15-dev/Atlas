@@ -17,11 +17,19 @@ from prompt_toolkit.application import Application
 from prompt_toolkit.application.run_in_terminal import in_terminal
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import Completer, Completion
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.formatted_text import ANSI, HTML
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout
-from prompt_toolkit.layout.containers import Float, FloatContainer, HSplit, VSplit, Window
+from prompt_toolkit.layout.containers import (
+    ConditionalContainer,
+    Float,
+    FloatContainer,
+    HSplit,
+    VSplit,
+    Window,
+)
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
@@ -189,6 +197,14 @@ class CLIPlugin(AtlasPlugin):
 
     def __init__(self):
         self._console = Console(highlight=False)
+        # Separate console for capturing markdown→ANSI strings to feed into
+        # prompt_toolkit's layout. force_terminal=True so rich emits color
+        # codes even though the capture target isn't a TTY.
+        self._render_console = Console(
+            force_terminal=True,
+            color_system="truecolor",
+            highlight=False,
+        )
         self._kernel = None
         self._running = False
         self._history = InMemoryHistory()
@@ -205,7 +221,10 @@ class CLIPlugin(AtlasPlugin):
         self._showed_thinking_header = False  # reset per turn — prefix once before reasoning stream
         self._showed_response_header = False  # reset per turn — newline boundary between reasoning and answer
         self._response_buffer = ""             # accumulates tokens; live-rendered as markdown
-        self._live: Optional[Live] = None      # rich.Live context — updated per token
+        # Streaming buffer drives a Window in the app layout — prompt_toolkit
+        # redraws it natively so live markdown rendering works without
+        # fighting patch_stdout.
+        self._streaming_buffer = ""
 
     # ── favorites accessors ───────────────────────────────────────────────
 
@@ -275,21 +294,42 @@ class CLIPlugin(AtlasPlugin):
         self._console.print(f"[dim italic]{token}[/dim italic]", end="", highlight=False)
 
     async def stream_token(self, token: str) -> None:
-        """Stream tokens live, re-rendering the accumulated buffer as markdown
-        in place via rich.Live. The user sees rendered output (bold, code
-        blocks, lists, headings) progressively — never raw `**markers**`."""
-        if self._showed_thinking_header and not self._showed_response_header:
-            self._console.print()
-            self._console.print()
-            self._showed_response_header = True
+        """Append the token to the streaming buffer and trigger an app redraw.
+        prompt_toolkit will re-call _streaming_text() during the redraw, which
+        re-renders the full buffer as markdown. As soon as a closing `**`
+        arrives in the stream, the rendered output flips to bold in place."""
         self._response_buffer += token
-        if self._live is not None:
+        self._streaming_buffer += token
+        if self._app is not None:
             try:
-                self._live.update(Markdown(self._response_buffer, code_theme="monokai"))
+                self._app.invalidate()
             except Exception:
-                # Partial fences / unbalanced markers crash the parser
+                pass
+
+    def _streaming_text(self):
+        """Live markdown render of the in-progress response.
+        Called by prompt_toolkit on every redraw. We render the current buffer
+        through rich.Markdown into a captured ANSI string, which the
+        FormattedTextControl displays as colored, bold-aware output."""
+        if not self._streaming_buffer:
+            return ""
+        # Match the render width to the terminal so wrapping is correct.
+        try:
+            width = shutil.get_terminal_size((80, 24)).columns
+            self._render_console.width = max(20, width)
+        except Exception:
+            pass
+        with self._render_console.capture() as cap:
+            try:
+                self._render_console.print(
+                    Markdown(self._streaming_buffer, code_theme="monokai"),
+                    end="",
+                )
+            except Exception:
+                # Partial fences / unbalanced markers can crash the parser
                 # mid-stream — fall back to plain text for this tick.
-                self._live.update(Text(self._response_buffer))
+                self._render_console.print(self._streaming_buffer, end="")
+        return ANSI(cap.get().rstrip("\n"))
 
     async def show_tool_call(self, tool_name: str) -> None:
         self._console.print(f"\n[dim]\\[calling: {tool_name}...][/dim]")
@@ -441,9 +481,22 @@ class CLIPlugin(AtlasPlugin):
             style="class:toolbar",
         )
 
+        # Live streaming area — sits ABOVE the input frame, height auto-fits
+        # the rendered markdown. prompt_toolkit redraws this natively on each
+        # invalidate(), so live in-place markdown rendering "just works".
+        streaming_window = Window(
+            FormattedTextControl(self._streaming_text, focusable=False),
+            wrap_lines=True,
+            dont_extend_height=True,
+        )
+        streaming_area = ConditionalContainer(
+            content=streaming_window,
+            filter=Condition(lambda: bool(self._streaming_buffer)),
+        )
+
         # Wrap in FloatContainer so the completion dropdown can render above the frame
         root = FloatContainer(
-            content=HSplit([framed, toolbar]),
+            content=HSplit([streaming_area, framed, toolbar]),
             floats=[
                 Float(
                     xcursor=True,
@@ -859,68 +912,79 @@ class CLIPlugin(AtlasPlugin):
     async def _processor_loop(self) -> None:
         """Drains submitted inputs from the queue.
 
-        For LLM streaming we suspend the framed app via in_terminal() so
-        rich.Live owns the terminal directly. patch_stdout swallows Live's
-        cursor-up re-renders, which is why streaming wasn't visible until
-        end of turn. The input box hides during the stream and reappears
-        the moment the response completes — same pattern Claude Code uses."""
+        Streaming model:
+        - Tokens flow into self._streaming_buffer.
+        - prompt_toolkit re-renders the streaming Window above the input box
+          on every app.invalidate() — that gives live, in-place markdown
+          rendering (so `**bold**` flips to bold the moment the closing `*`
+          arrives) without ever taking the input box away.
+        - When the response completes, we print the final markdown to scroll
+          history and clear the streaming buffer so the live area collapses."""
         agent = self._kernel.get_plugin("agent")
 
-        while self._running:
-            try:
-                user_input = await asyncio.wait_for(
-                    self._input_queue.get(), timeout=0.5
-                )
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                break
+        with patch_stdout(raw=True):
+            while self._running:
+                try:
+                    user_input = await asyncio.wait_for(
+                        self._input_queue.get(), timeout=0.5
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    break
 
-            # Echo + slash commands: keep the framed input visible.
-            if user_input.startswith("/"):
-                with patch_stdout(raw=True):
-                    self._console.print(f"\n[bold cyan]›[/bold cyan] {user_input}")
+                self._console.print(f"\n[bold cyan]›[/bold cyan] {user_input}")
+
+                if user_input.startswith("/"):
                     try:
                         handled = await self._handle_command(user_input)
                         if not handled:
                             self._p("[dim red]unknown command. type /help[/dim red]")
                     except Exception as e:
                         self._p(f"[bold red]command error: {e}[/bold red]")
-                continue
+                    continue
 
-            self._is_processing = True
-            self._showed_thinking_header = False
-            self._showed_response_header = False
-            self._response_buffer = ""
+                self._is_processing = True
+                self._showed_thinking_header = False
+                self._showed_response_header = False
+                self._response_buffer = ""
+                self._streaming_buffer = ""
+                if self._app is not None:
+                    self._app.invalidate()
 
-            # Suspend the app so rich.Live can take the terminal directly.
-            async with in_terminal():
-                self._console.print(f"\n[bold cyan]›[/bold cyan] {user_input}")
-                self._console.print()
-                with Live(
-                    Text(""),
-                    console=self._console,
-                    transient=False,
-                    refresh_per_second=20,
-                    auto_refresh=True,
-                ) as live:
-                    self._live = live
-                    self._current_process_task = asyncio.create_task(
-                        agent.process(
-                            user_input,
-                            on_token=self.stream_token,
-                            on_tool_call=self.show_tool_call,
-                            on_reasoning=self.stream_reasoning,
-                        )
+                self._current_process_task = asyncio.create_task(
+                    agent.process(
+                        user_input,
+                        on_token=self.stream_token,
+                        on_tool_call=self.show_tool_call,
+                        on_reasoning=self.stream_reasoning,
                     )
+                )
+                error_msg = None
+                try:
+                    await self._current_process_task
+                except asyncio.CancelledError:
+                    error_msg = "[interrupted]"
+                except Exception as e:
+                    error_msg = f"[error: {e}]"
+                finally:
+                    self._current_process_task = None
+                    self._is_processing = False
+
+                # Promote the live render to scroll history, then collapse
+                # the live area. Print the rendered markdown directly so the
+                # final output sits cleanly above the input box.
+                final_text = self._response_buffer
+                self._streaming_buffer = ""
+                if self._app is not None:
+                    self._app.invalidate()
+                if final_text.strip():
                     try:
-                        await self._current_process_task
-                    except asyncio.CancelledError:
-                        live.update(Text(self._response_buffer + "\n[interrupted]"))
-                    except Exception as e:
-                        live.update(Text(f"{self._response_buffer}\n[error: {e}]"))
-                    finally:
-                        self._current_process_task = None
-                        self._is_processing = False
-                        self._live = None
+                        self._console.print(
+                            Markdown(final_text, code_theme="monokai")
+                        )
+                    except Exception:
+                        self._console.print(final_text)
+                if error_msg:
+                    self._console.print(f"[dim]{error_msg}[/dim]")
                 self._console.print()
