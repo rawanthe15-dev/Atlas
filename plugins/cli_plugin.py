@@ -921,13 +921,4 @@ class CLIPlugin(AtlasPlugin):
                     self._current_process_task = None
                     self._is_processing = False
 
-                # Raw stream is already on screen. Print clean markdown below it.
-                self._p()
-                if self._response_buffer.strip():
-                    try:
-                        self._console.print(
-                            Markdown(self._response_buffer, code_theme="monokai")
-                        )
-                    except Exception:
-                        pass  # raw stream is already visible, no need to duplicate
                 self._p()
