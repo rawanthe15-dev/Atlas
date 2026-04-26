@@ -287,17 +287,27 @@ class CLIPlugin(AtlasPlugin):
         self._console.print(text, style=style, end="\n")
 
     async def stream_reasoning(self, token: str) -> None:
-        """Print reasoning tokens dimly, prefixed once with a '✦ thinking' header."""
+        """Show a 'thinking…' indicator in the streaming Window while the model
+        reasons. We don't show every reasoning token (too noisy) — just a
+        steady marker that flips to the actual response when it arrives."""
         if not self._showed_thinking_header:
-            self._console.print("[dim italic]✦ thinking[/dim italic]", style="")
+            self._streaming_buffer = "*✦ thinking…*"
             self._showed_thinking_header = True
-        self._console.print(f"[dim italic]{token}[/dim italic]", end="", highlight=False)
+            if self._app is not None:
+                try:
+                    self._app.invalidate()
+                except Exception:
+                    pass
 
     async def stream_token(self, token: str) -> None:
         """Append the token to the streaming buffer and trigger an app redraw.
         prompt_toolkit will re-call _streaming_text() during the redraw, which
         re-renders the full buffer as markdown. As soon as a closing `**`
         arrives in the stream, the rendered output flips to bold in place."""
+        # First response token after reasoning → drop the thinking indicator.
+        if self._showed_thinking_header and not self._showed_response_header:
+            self._streaming_buffer = ""
+            self._showed_response_header = True
         self._response_buffer += token
         self._streaming_buffer += token
         if self._app is not None:
@@ -913,78 +923,84 @@ class CLIPlugin(AtlasPlugin):
         """Drains submitted inputs from the queue.
 
         Streaming model:
-        - Tokens flow into self._streaming_buffer.
-        - prompt_toolkit re-renders the streaming Window above the input box
-          on every app.invalidate() — that gives live, in-place markdown
-          rendering (so `**bold**` flips to bold the moment the closing `*`
-          arrives) without ever taking the input box away.
-        - When the response completes, we print the final markdown to scroll
-          history and clear the streaming buffer so the live area collapses."""
+        - During the LLM response, tokens flow into self._streaming_buffer
+          and the streaming Window in the app layout re-renders on every
+          app.invalidate(). This gives live in-place markdown rendering
+          while the input box stays visible — no patch_stdout, no
+          in_terminal during the stream.
+        - Non-streaming output (echo, slash command output, final
+          markdown promoted to scroll) is printed via in_terminal() so it
+          lands above the app cleanly. The app briefly suspends and
+          resumes for those — the streaming itself never suspends.
+        """
         agent = self._kernel.get_plugin("agent")
 
-        with patch_stdout(raw=True):
-            while self._running:
-                try:
-                    user_input = await asyncio.wait_for(
-                        self._input_queue.get(), timeout=0.5
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                except asyncio.CancelledError:
-                    break
+        while self._running:
+            try:
+                user_input = await asyncio.wait_for(
+                    self._input_queue.get(), timeout=0.5
+                )
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
 
+            # Echo the user's submission to scroll history.
+            async with in_terminal():
                 self._console.print(f"\n[bold cyan]›[/bold cyan] {user_input}")
 
-                if user_input.startswith("/"):
+            if user_input.startswith("/"):
+                async with in_terminal():
                     try:
                         handled = await self._handle_command(user_input)
                         if not handled:
                             self._p("[dim red]unknown command. type /help[/dim red]")
                     except Exception as e:
                         self._p(f"[bold red]command error: {e}[/bold red]")
-                    continue
+                continue
 
-                self._is_processing = True
-                self._showed_thinking_header = False
-                self._showed_response_header = False
-                self._response_buffer = ""
-                self._streaming_buffer = ""
-                if self._app is not None:
-                    self._app.invalidate()
+            self._is_processing = True
+            self._showed_thinking_header = False
+            self._showed_response_header = False
+            self._response_buffer = ""
+            self._streaming_buffer = ""
+            if self._app is not None:
+                self._app.invalidate()
 
-                self._current_process_task = asyncio.create_task(
-                    agent.process(
-                        user_input,
-                        on_token=self.stream_token,
-                        on_tool_call=self.show_tool_call,
-                        on_reasoning=self.stream_reasoning,
-                    )
+            self._current_process_task = asyncio.create_task(
+                agent.process(
+                    user_input,
+                    on_token=self.stream_token,
+                    on_tool_call=self.show_tool_call,
+                    on_reasoning=self.stream_reasoning,
                 )
-                error_msg = None
-                try:
-                    await self._current_process_task
-                except asyncio.CancelledError:
-                    error_msg = "[interrupted]"
-                except Exception as e:
-                    error_msg = f"[error: {e}]"
-                finally:
-                    self._current_process_task = None
-                    self._is_processing = False
+            )
+            error_msg = None
+            try:
+                await self._current_process_task
+            except asyncio.CancelledError:
+                error_msg = "[interrupted]"
+            except Exception as e:
+                error_msg = f"[error: {e}]"
+            finally:
+                self._current_process_task = None
+                self._is_processing = False
 
-                # Promote the live render to scroll history, then collapse
-                # the live area. Print the rendered markdown directly so the
-                # final output sits cleanly above the input box.
-                final_text = self._response_buffer
-                self._streaming_buffer = ""
-                if self._app is not None:
-                    self._app.invalidate()
-                if final_text.strip():
-                    try:
-                        self._console.print(
-                            Markdown(final_text, code_theme="monokai")
-                        )
-                    except Exception:
-                        self._console.print(final_text)
-                if error_msg:
-                    self._console.print(f"[dim]{error_msg}[/dim]")
-                self._console.print()
+            # Promote the live render to scroll history. Collapse the live
+            # area FIRST so the user doesn't briefly see it twice.
+            final_text = self._response_buffer
+            self._streaming_buffer = ""
+            if self._app is not None:
+                self._app.invalidate()
+            if final_text.strip() or error_msg:
+                async with in_terminal():
+                    if final_text.strip():
+                        try:
+                            self._console.print(
+                                Markdown(final_text, code_theme="monokai")
+                            )
+                        except Exception:
+                            self._console.print(final_text)
+                    if error_msg:
+                        self._console.print(f"[dim]{error_msg}[/dim]")
+                    self._console.print()
