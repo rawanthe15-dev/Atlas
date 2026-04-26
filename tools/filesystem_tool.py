@@ -1,6 +1,9 @@
 from pathlib import Path
 from .base import Tool
 
+# Cap file reads to keep context windows safe.
+DEFAULT_MAX_CHARS = 8000
+
 
 class ReadFileTool(Tool):
     name = "read_file"
@@ -14,15 +17,28 @@ class ReadFileTool(Tool):
         "required": ["path"],
     }
 
+    def __init__(self, max_chars: int = DEFAULT_MAX_CHARS):
+        self._max_chars = max_chars
+
     async def run(self, path: str, max_lines: int = 200) -> str:
         try:
             p = Path(path)
             if not p.exists():
                 return f"File not found: {path}"
-            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-            if len(lines) > max_lines:
-                return "\n".join(lines[:max_lines]) + f"\n... ({len(lines)} total lines, truncated)"
-            return "\n".join(lines)
+            text = p.read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
+            total_lines = len(lines)
+
+            if total_lines > max_lines:
+                text = "\n".join(lines[:max_lines]) + f"\n... ({total_lines} total lines, truncated by max_lines)"
+
+            if len(text) > self._max_chars:
+                head = text[: self._max_chars - 200]
+                tail = text[-200:]
+                omitted = len(text) - self._max_chars
+                text = f"{head}\n... ({omitted} chars truncated) ...\n{tail}"
+
+            return text
         except Exception as e:
             return f"Error reading {path}: {e}"
 

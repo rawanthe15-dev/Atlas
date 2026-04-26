@@ -1,12 +1,30 @@
 import asyncio
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
 from typing import Optional
 
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.rule import Rule
+
+
+# Regex that detects "this response benefits from markdown rendering"
+MARKDOWN_RE = re.compile(
+    r"(^#{1,6} |^\* |^- |^\d+\. |```|\*\*[^\s*][^*]*\*\*|`[^`]+`|^\| .*\|)",
+    re.MULTILINE,
+)
+
+
+def _looks_like_markdown(text: str) -> bool:
+    """Cheap heuristic: render markdown only when it'll add real value."""
+    if "\n" not in text:
+        return False
+    if len(text) < 100:
+        return False
+    return bool(MARKDOWN_RE.search(text))
 
 from functools import partial
 
@@ -201,6 +219,7 @@ class CLIPlugin(AtlasPlugin):
         self._is_processing = False  # toolbar shows "thinking..." when True
         self._showed_thinking_header = False  # reset per turn — prefix once before reasoning stream
         self._showed_response_header = False  # reset per turn — newline boundary between reasoning and answer
+        self._response_buffer = ""             # accumulates tokens to optionally re-render as markdown
 
     # ── favorites accessors ───────────────────────────────────────────────
 
@@ -222,6 +241,13 @@ class CLIPlugin(AtlasPlugin):
         self._running = True
         self._input_queue = asyncio.Queue()
 
+        # Wire the shell-confirm callback if config asks for it
+        shell_confirm = kernel.config.get("tools", {}).get("shell_confirm", True)
+        if shell_confirm:
+            shell_tool = kernel.get_plugin("tools").get("shell")
+            if shell_tool and hasattr(shell_tool, "set_confirm"):
+                shell_tool.set_confirm(self._confirm_shell)
+
         # Print the static startup banner first (via normal stdout, no live area yet)
         await self._render_startup()
 
@@ -231,9 +257,11 @@ class CLIPlugin(AtlasPlugin):
         # Start the processor coroutine that drains the input queue
         self._processor_task = asyncio.create_task(self._processor_loop())
 
-        # Run the application — blocks until /exit or Ctrl-D
+        # Run the application — blocks until /exit or Ctrl-D / EOF
         try:
             await self._app.run_async()
+        except (EOFError, KeyboardInterrupt):
+            pass
         finally:
             self._running = False
             if self._processor_task and not self._processor_task.done():
@@ -266,6 +294,7 @@ class CLIPlugin(AtlasPlugin):
             self._console.print()
             self._console.print()
             self._showed_response_header = True
+        self._response_buffer += token
         self._console.print(token, end="", highlight=False)
 
     async def show_tool_call(self, tool_name: str) -> None:
@@ -716,6 +745,15 @@ class CLIPlugin(AtlasPlugin):
             self._save_config_key("openrouter", "favorite_models", cleaned)
             self._kernel.config.setdefault("openrouter", {})["favorite_models"] = cleaned
 
+    async def _confirm_shell(self, command: str) -> bool:
+        """Ask the user to approve a shell command before ShellTool runs it."""
+        async with in_terminal():
+            self._console.print()
+            self._console.print(f"[bold yellow]⚠  shell command requested[/bold yellow]")
+            self._console.print(f"  [bright_white]{command}[/bright_white]")
+            answer = (await self._simple_prompt("run this? (y/N) › ")).strip().lower()
+        return answer in ("y", "yes")
+
     async def _simple_prompt(self, label: str, is_password: bool = False) -> str:
         """Quick non-framed prompt for /config sub-questions."""
         from prompt_toolkit import PromptSession
@@ -856,6 +894,7 @@ class CLIPlugin(AtlasPlugin):
                 self._is_processing = True
                 self._showed_thinking_header = False
                 self._showed_response_header = False
+                self._response_buffer = ""
                 self._p()
                 self._current_process_task = asyncio.create_task(
                     agent.process(
@@ -874,4 +913,16 @@ class CLIPlugin(AtlasPlugin):
                 finally:
                     self._current_process_task = None
                     self._is_processing = False
+
+                # Re-render the response as markdown if it has structure worth formatting
+                if _looks_like_markdown(self._response_buffer):
+                    self._console.print()
+                    self._console.rule(style="#3a4a5a", characters="─")
+                    try:
+                        self._console.print(
+                            Markdown(self._response_buffer, code_theme="monokai")
+                        )
+                    except Exception:
+                        # If markdown parsing fails for any reason, the raw stream above is still visible
+                        pass
                 self._p()
