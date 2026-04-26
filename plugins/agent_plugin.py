@@ -28,6 +28,7 @@ class AgentPlugin(AtlasPlugin):
         self._base_url = OPENROUTER_URL
         self._max_context_entries = 5
         self._max_session_history = 3
+        self._background_tasks: set = set()
 
     async def load(self, kernel) -> None:
         self._kernel = kernel
@@ -40,7 +41,9 @@ class AgentPlugin(AtlasPlugin):
         self._max_session_history = mem_cfg.get("max_session_history", 3)
 
     async def unload(self) -> None:
-        pass
+        for task in list(self._background_tasks):
+            task.cancel()
+        self._background_tasks.clear()
 
     def set_model(self, model: str) -> None:
         self._model = model
@@ -151,13 +154,19 @@ class AgentPlugin(AtlasPlugin):
         # Persist to history and session
         self._history.append({"role": "user", "content": user_input})
         self._history.append({"role": "assistant", "content": full_response})
+        # Keep only the last N exchanges (each = 2 messages: user + assistant)
+        MAX_HISTORY_MESSAGES = 40  # ~20 exchanges
+        if len(self._history) > MAX_HISTORY_MESSAGES:
+            self._history = self._history[-MAX_HISTORY_MESSAGES:]
         await self._kernel.memory.append_session(
             self._session_id,
             {"user": user_input, "assistant": full_response, "timestamp": _utcnow()},
         )
 
         # Background memory reflection — never blocks the user
-        asyncio.create_task(self._reflect(user_input, full_response))
+        task = asyncio.create_task(self._reflect(user_input, full_response))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
         return full_response
 
@@ -190,7 +199,8 @@ class AgentPlugin(AtlasPlugin):
                     except json.JSONDecodeError:
                         continue
 
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    choices = chunk.get("choices") or [{}]
+                    delta = choices[0].get("delta", {})
 
                     if delta.get("content"):
                         yield ("token", delta["content"])
@@ -202,7 +212,7 @@ class AgentPlugin(AtlasPlugin):
                         if tc.get("id"):
                             tool_calls_buf[idx]["id"] = tc["id"]
                         if tc.get("function", {}).get("name"):
-                            tool_calls_buf[idx]["name"] += tc["function"]["name"]
+                            tool_calls_buf[idx]["name"] = tc["function"]["name"]
                         if tc.get("function", {}).get("arguments"):
                             tool_calls_buf[idx]["arguments"] += tc["function"]["arguments"]
 
@@ -249,7 +259,7 @@ class AgentPlugin(AtlasPlugin):
                 )
                 resp.raise_for_status()
                 result = resp.json()["choices"][0]["message"]["content"].strip()
-            if result and result != "NO_UPDATE":
+            if result and result.upper() != "NO_UPDATE":
                 await self._kernel.memory.update_user_profile(result)
         except Exception:
             pass  # never surface reflection errors to the user

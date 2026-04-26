@@ -71,3 +71,41 @@ async def test_agent_set_model(tmp_path):
     agent, _ = await _make_agent_with_kernel(tmp_path)
     agent.set_model("deepseek/deepseek-r1")
     assert agent._model == "deepseek/deepseek-r1"
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_calling_loop(tmp_path):
+    """Verify that when the model returns a tool_call, the loop executes it
+    and feeds the result back to the model for a second round."""
+    agent, kernel = await _make_agent_with_kernel(tmp_path)
+
+    call_count = {"n": 0}
+
+    async def fake_stream(messages, tools):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # First round: model returns a tool call (no text)
+            yield ("tool_call", {
+                "id": "call_1",
+                "name": "remember",
+                "arguments": '{"content": "Atlas is awesome"}'
+            })
+        else:
+            # Second round: model returns final text after seeing tool result
+            yield ("token", "I remembered that for you.")
+
+    tool_calls_seen = []
+
+    async def on_tool(name):
+        tool_calls_seen.append(name)
+
+    with patch.object(agent, "_stream", side_effect=fake_stream):
+        with patch.object(agent, "_reflect", return_value=None):
+            result = await agent.process("remember Atlas is awesome", on_tool_call=on_tool)
+
+    assert call_count["n"] == 2  # two streaming rounds
+    assert "remember" in tool_calls_seen
+    assert "I remembered that for you." in result
+    # Verify the memory entry was actually written by the tool
+    entries = await kernel.memory.search("Atlas awesome")
+    assert len(entries) >= 1
