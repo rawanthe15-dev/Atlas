@@ -298,10 +298,10 @@ class CLIPlugin(AtlasPlugin):
             self._console.print()
             self._showed_response_header = True
         self._response_buffer += token
-        # Print the raw token immediately — this goes through patch_stdout's
-        # proxy, which flushes to the terminal on the next event-loop tick.
-        # The user sees each token as it arrives (real streaming).
-        self._console.print(token, end="", highlight=False, soft_wrap=True)
+        self._console.print(token, end="", highlight=False)
+        # Yield to the event loop so patch_stdout's proxy actually flushes
+        # the token to the terminal before the next chunk arrives.
+        await asyncio.sleep(0)
 
     async def show_tool_call(self, tool_name: str) -> None:
         self._console.print(f"\n[dim]\\[calling: {tool_name}...][/dim]")
@@ -903,22 +903,18 @@ class CLIPlugin(AtlasPlugin):
                 self._response_buffer = ""
                 self._p()
 
-                self._current_process_task = asyncio.create_task(
-                    agent.process(
+                try:
+                    await agent.process(
                         user_input,
                         on_token=self.stream_token,
                         on_tool_call=self.show_tool_call,
                         on_reasoning=self.stream_reasoning,
                     )
-                )
-                try:
-                    await self._current_process_task
                 except asyncio.CancelledError:
                     self._p("[dim]\n[interrupted][/dim]")
                 except Exception as e:
                     self._p(f"[dim red]\n[error: {e}][/dim red]")
                 finally:
-                    self._current_process_task = None
                     self._is_processing = False
 
                 self._p()
