@@ -1,0 +1,9 @@
+.env
+config.toml
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.superpowers/
+memory/sessions/
+memory/index/
