@@ -7,6 +7,12 @@ api_key = ""
 default_model = "deepseek/deepseek-chat"
 reasoning_model = "deepseek/deepseek-r1"
 base_url = "https://openrouter.ai/api/v1/chat/completions"
+# Up to 3 favorite models — autocompleted when typing /model <space>
+favorite_models = [
+    "deepseek/deepseek-chat",
+    "deepseek/deepseek-r1",
+    "anthropic/claude-sonnet-4-5",
+]
 
 [memory]
 backend = "file"

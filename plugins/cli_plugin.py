@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Optional
@@ -7,12 +8,45 @@ from typing import Optional
 from rich.console import Console
 from rich.rule import Rule
 
-from prompt_toolkit import PromptSession
+from functools import partial
+
+from prompt_toolkit.application import Application
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
-from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Layout
+from prompt_toolkit.layout.containers import HSplit, VSplit, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.styles import Style
+from prompt_toolkit.widgets import TextArea
+
+
+def rounded_frame(body):
+    """Frame with rounded corners (╭╮╰╯) — Claude Code style."""
+    fill = partial(Window, style="class:frame.border")
+    return HSplit(
+        [
+            VSplit([
+                fill(width=1, height=1, char="╭"),
+                fill(char="─", height=1),
+                fill(width=1, height=1, char="╮"),
+            ]),
+            VSplit([
+                fill(width=1, char="│"),
+                body,
+                fill(width=1, char="│"),
+            ]),
+            VSplit([
+                fill(width=1, height=1, char="╰"),
+                fill(char="─", height=1),
+                fill(width=1, height=1, char="╯"),
+            ]),
+        ],
+        style="class:frame",
+    )
 
 try:
     import tomllib  # py311+
@@ -51,8 +85,8 @@ ATLAS_ART_ASCII = [
 COMMANDS = {
     "/help":         "Show available commands",
     "/config":       "Edit settings, API keys, persona",
-    "/memory":       "Show what Atlas knows about you (USER.md)",
-    "/soul":         "Show Atlas's identity (SOUL.md)",
+    "/memory":       "Show what Atlas knows about you",
+    "/soul":         "Show Atlas's identity",
     "/tools":        "List available tools",
     "/sessions":     "List recent conversation sessions",
     "/model":        "Switch model — usage: /model <name>",
@@ -63,17 +97,19 @@ COMMANDS = {
 }
 
 
-PROMPT_STYLE = Style.from_dict({
-    "prompt-symbol":     "ansicyan bold",
-    "prompt-name":       "bold",
-    "prompt-arrow":      "ansibrightblack",
-    "completion-menu.completion":          "bg:#1a1a1a #cccccc",
-    "completion-menu.completion.current":  "bg:#0078d4 #ffffff bold",
-    "completion-menu.meta.completion":     "bg:#1a1a1a #888888",
-    "completion-menu.meta.completion.current": "bg:#0078d4 #ffffff",
-    "bottom-toolbar":    "bg:#1a1a1a #888888",
-    "bottom-toolbar.text": "#888888",
-    "bottom-toolbar.accent": "ansicyan",
+# Style for the input application
+INPUT_STYLE = Style.from_dict({
+    "frame.border":        "#5a5a5a",
+    "frame.label":         "ansicyan bold",
+    "input":               "",
+    "toolbar":             "#666666 italic",
+    "toolbar.accent":      "ansicyan",
+    "toolbar.warn":        "ansiyellow",
+    "completion-menu":                   "bg:#1a1a1a #cccccc",
+    "completion-menu.completion":        "bg:#1a1a1a #cccccc",
+    "completion-menu.completion.current": "bg:#0078d4 #ffffff bold",
+    "completion-menu.meta":              "bg:#1a1a1a #888888",
+    "completion-menu.meta.current":      "bg:#0078d4 #ffffff",
 })
 
 
@@ -85,13 +121,43 @@ def _is_utf8() -> bool:
         return False
 
 
+DEFAULT_FAVORITES = [
+    "deepseek/deepseek-chat",
+    "deepseek/deepseek-r1",
+    "anthropic/claude-sonnet-4-5",
+]
+
+
 class SlashCompleter(Completer):
-    """Pop the command list as soon as the user types '/'"""
+    """Pop the command list when the user types '/', suggest favorite models for /model."""
+
+    def __init__(self, favorites_getter=None, current_model_getter=None):
+        self._favorites = favorites_getter or (lambda: [])
+        self._current_model = current_model_getter or (lambda: "")
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
         if not text.startswith("/"):
             return
+
+        # /model <arg> → suggest favorite models
+        if text.startswith("/model "):
+            arg = text[len("/model "):]
+            current = self._current_model()
+            for model in self._favorites():
+                if not model:
+                    continue
+                if model.startswith(arg):
+                    meta = "current" if model == current else "favorite"
+                    yield Completion(
+                        model,
+                        start_position=-len(arg),
+                        display=model,
+                        display_meta=meta,
+                    )
+            return
+
+        # Top-level slash commands
         for full_cmd, desc in COMMANDS.items():
             cmd = full_cmd.split()[0]
             if cmd.startswith(text):
@@ -110,20 +176,30 @@ class CLIPlugin(AtlasPlugin):
         self._console = Console(highlight=False)
         self._kernel = None
         self._running = False
-        self._session: Optional[PromptSession] = None
+        self._history = InMemoryHistory()
+        self._completer = SlashCompleter(
+            favorites_getter=self._get_favorite_models,
+            current_model_getter=self._get_current_model,
+        )
+
+    # ── favorites accessors ───────────────────────────────────────────────
+
+    def _get_favorite_models(self) -> list:
+        if self._kernel is None:
+            return list(DEFAULT_FAVORITES)
+        favs = self._kernel.config.get("openrouter", {}).get("favorite_models")
+        if not favs:
+            favs = list(DEFAULT_FAVORITES)
+        return favs
+
+    def _get_current_model(self) -> str:
+        if self._kernel is None:
+            return ""
+        return self._kernel.config.get("openrouter", {}).get("default_model", "")
 
     async def load(self, kernel) -> None:
         self._kernel = kernel
         self._running = True
-        self._session = PromptSession(
-            history=InMemoryHistory(),
-            completer=SlashCompleter(),
-            complete_while_typing=True,
-            multiline=False,
-            bottom_toolbar=self._toolbar,
-            style=PROMPT_STYLE,
-            mouse_support=False,
-        )
         await self._run()
 
     async def unload(self) -> None:
@@ -139,18 +215,6 @@ class CLIPlugin(AtlasPlugin):
 
     async def show_tool_call(self, tool_name: str) -> None:
         self._console.print(f"\n[dim]\\[calling: {tool_name}...][/dim]")
-
-    def _toolbar(self):
-        cfg = self._kernel.config.get("openrouter", {})
-        model = cfg.get("default_model", "?")
-        agent = self._kernel.get_plugin("agent")
-        n = len(agent._history) // 2
-        api_ok = "●" if cfg.get("api_key") else "○"
-        return HTML(
-            f" <b>atlas</b>  <ansicyan>{api_ok}</ansicyan> {model}  ·  "
-            f"{n} exchange{'s' if n != 1 else ''}  ·  "
-            f"<ansibrightblack>type / for commands</ansibrightblack> "
-        )
 
     # ── animated startup ───────────────────────────────────────────────────
 
@@ -182,8 +246,78 @@ class CLIPlugin(AtlasPlugin):
             await asyncio.sleep(0.4)
 
         self._console.print()
-        self._console.print(Rule(style="bright_black"))
-        self._console.print()
+
+    # ── framed input box ──────────────────────────────────────────────────
+
+    def _toolbar_text(self):
+        cfg = self._kernel.config.get("openrouter", {})
+        model = cfg.get("default_model", "?")
+        agent = self._kernel.get_plugin("agent")
+        n = len(agent._history) // 2
+        api_set = bool(cfg.get("api_key"))
+        dot = ("class:toolbar.accent", "●") if api_set else ("class:toolbar.warn", "○")
+        return [
+            ("class:toolbar", "  "),
+            dot,
+            ("class:toolbar", f"  {model}  ·  {n} exchange{'s' if n != 1 else ''}  ·  type "),
+            ("class:toolbar.accent", "/"),
+            ("class:toolbar", " for commands"),
+        ]
+
+    def _build_input_app(self) -> tuple:
+        """Build a fresh Application around a framed TextArea and return (app, text_area)."""
+        text_area = TextArea(
+            multiline=False,
+            wrap_lines=True,
+            completer=self._completer,
+            history=self._history,
+            complete_while_typing=True,
+            scrollbar=False,
+            style="class:input",
+            prompt="◈ ",
+        )
+
+        kb = KeyBindings()
+
+        @kb.add("enter")
+        def _(event):
+            event.app.exit(result=text_area.text)
+
+        @kb.add("c-c")
+        def _(event):
+            event.app.exit(result="")
+
+        @kb.add("c-d")
+        def _(event):
+            if not text_area.text:
+                event.app.exit(result=None)
+
+        framed = rounded_frame(text_area)
+        toolbar = Window(
+            FormattedTextControl(self._toolbar_text),
+            height=Dimension.exact(1),
+            style="class:toolbar",
+        )
+
+        layout = Layout(HSplit([framed, toolbar]))
+
+        app = Application(
+            layout=layout,
+            key_bindings=kb,
+            full_screen=False,
+            erase_when_done=True,
+            style=INPUT_STYLE,
+            mouse_support=False,
+        )
+        return app, text_area
+
+    async def _get_input(self):
+        """Run the framed input app, return the submitted text (or None on EOF)."""
+        app, text_area = self._build_input_app()
+        try:
+            return await app.run_async()
+        except (EOFError, KeyboardInterrupt):
+            return None
 
     # ── command handling ───────────────────────────────────────────────────
 
@@ -225,9 +359,11 @@ class CLIPlugin(AtlasPlugin):
             if arg:
                 self._kernel.get_plugin("agent").set_model(arg)
                 self._save_config_key("openrouter", "default_model", arg)
+                self._kernel.config["openrouter"]["default_model"] = arg
                 self._p(f"[green]✓ model:[/green] {arg}")
             else:
-                self._p("[dim]usage: /model <model-name>[/dim]")
+                # No arg → show favorites with numeric pick + "type a new name" option
+                await self._pick_model_interactive()
             return True
 
         if cmd == "/sessions":
@@ -263,12 +399,58 @@ class CLIPlugin(AtlasPlugin):
 
         return False
 
+    # ── /model interactive picker ──────────────────────────────────────────
+
+    async def _pick_model_interactive(self) -> None:
+        favs = self._get_favorite_models()
+        current = self._get_current_model()
+
+        self._p()
+        self._p("[bold]switch model[/bold]")
+        for i, m in enumerate(favs, 1):
+            marker = "[green]●[/green]" if m == current else "[bright_black]○[/bright_black]"
+            label = m if m else "[dim](empty slot)[/dim]"
+            self._p(f"  {marker} [bold cyan]{i}[/bold cyan]  {label}")
+        self._p(f"  [bright_black]○[/bright_black] [bold cyan]n[/bold cyan]  use a new model")
+        self._p(f"  [bright_black]○[/bright_black] [bold cyan]b[/bold cyan]  back")
+        self._p()
+
+        choice = (await self._simple_prompt("pick › ")).strip().lower()
+        if not choice or choice == "b":
+            return
+
+        if choice == "n":
+            new_model = (await self._simple_prompt("new model name › ")).strip()
+            if not new_model:
+                return
+            self._apply_model(new_model)
+            return
+
+        try:
+            idx = int(choice) - 1
+            if not (0 <= idx < len(favs)):
+                raise ValueError
+            chosen = favs[idx]
+            if not chosen:
+                self._p("[dim red]that slot is empty — use /config to fill it[/dim red]")
+                return
+            self._apply_model(chosen)
+        except ValueError:
+            self._p("[dim red]invalid choice[/dim red]")
+
+    def _apply_model(self, model: str) -> None:
+        self._kernel.get_plugin("agent").set_model(model)
+        self._save_config_key("openrouter", "default_model", model)
+        self._kernel.config["openrouter"]["default_model"] = model
+        self._p(f"[green]✓ model:[/green] {model}")
+
     # ── /config interactive ────────────────────────────────────────────────
 
     async def _handle_config(self) -> None:
         options = [
             ("openrouter_key",  "Set OpenRouter API key"),
             ("default_model",   "Set default model"),
+            ("favorites",       "Manage favorite models (used by /model autocomplete)"),
             ("brave_key",       "Set Brave Search API key"),
             ("edit_soul",       "Edit SOUL.md (Atlas's persona)"),
             ("edit_user",       "Edit USER.md (what Atlas knows about you)"),
@@ -283,10 +465,7 @@ class CLIPlugin(AtlasPlugin):
             self._p(f"  [bold cyan]{i:>2}[/bold cyan]  {desc}")
         self._p()
 
-        try:
-            choice = await self._prompt(HTML("<ansicyan>?</ansicyan> select › "))
-        except (KeyboardInterrupt, EOFError):
-            return
+        choice = await self._simple_prompt("select › ")
         if not choice:
             return
 
@@ -304,10 +483,7 @@ class CLIPlugin(AtlasPlugin):
             return
 
         if action == "openrouter_key":
-            new_key = await self._prompt(
-                HTML("<ansicyan>?</ansicyan> openrouter api key › "),
-                is_password=True,
-            )
+            new_key = await self._simple_prompt("openrouter api key › ", is_password=True)
             if new_key and new_key.strip():
                 self._save_config_key("openrouter", "api_key", new_key.strip())
                 self._kernel.config["openrouter"]["api_key"] = new_key.strip()
@@ -316,9 +492,7 @@ class CLIPlugin(AtlasPlugin):
 
         elif action == "default_model":
             current = self._kernel.config.get("openrouter", {}).get("default_model", "")
-            new_model = await self._prompt(
-                HTML(f"<ansicyan>?</ansicyan> model name (current: {current}) › "),
-            )
+            new_model = await self._simple_prompt(f"model name (current: {current}) › ")
             if new_model and new_model.strip():
                 model = new_model.strip()
                 self._save_config_key("openrouter", "default_model", model)
@@ -326,11 +500,11 @@ class CLIPlugin(AtlasPlugin):
                 self._kernel.get_plugin("agent").set_model(model)
                 self._p(f"[green]✓ model:[/green] {model}")
 
+        elif action == "favorites":
+            await self._manage_favorites()
+
         elif action == "brave_key":
-            new_key = await self._prompt(
-                HTML("<ansicyan>?</ansicyan> brave search api key › "),
-                is_password=True,
-            )
+            new_key = await self._simple_prompt("brave search api key › ", is_password=True)
             if new_key and new_key.strip():
                 self._save_config_key("tools", "brave_api_key", new_key.strip())
                 self._p("[green]✓ key saved (restart atlas to apply)[/green]")
@@ -342,9 +516,7 @@ class CLIPlugin(AtlasPlugin):
             await self._open_in_editor(ATLAS_ROOT / "memory" / "USER.md")
 
         elif action == "reset_user":
-            confirm = await self._prompt(
-                HTML("<ansicyan>?</ansicyan> reset USER.md? type <b>yes</b> › "),
-            )
+            confirm = await self._simple_prompt("reset USER.md? type yes › ")
             if confirm and confirm.strip().lower() == "yes":
                 await self._kernel.memory.update_user_profile(
                     "# User Profile\n\n## Identity\n\n## Preferences\n\n"
@@ -366,10 +538,62 @@ class CLIPlugin(AtlasPlugin):
                 self._p(f"  [dim]{label:<16}[/dim] {val}")
             self._p()
 
-    async def _prompt(self, text, is_password=False) -> str:
+    async def _manage_favorites(self) -> None:
+        """Edit the 3-slot list of favorite models."""
+        # Ensure we always work with a 3-slot list
+        favs = list(self._get_favorite_models())
+        while len(favs) < 3:
+            favs.append("")
+        favs = favs[:3]
+
+        while True:
+            self._p()
+            self._p("[bold]favorite models[/bold] [dim](shown when you type /model <space>)[/dim]")
+            for i, m in enumerate(favs, 1):
+                label = m if m else "[dim](empty)[/dim]"
+                self._p(f"  [bold cyan]{i}[/bold cyan]  {label}")
+            self._p()
+            self._p("  [bold cyan]1-3[/bold cyan]  edit slot")
+            self._p("  [bold cyan]b[/bold cyan]    back")
+            self._p()
+
+            choice = (await self._simple_prompt("favorites › ")).strip().lower()
+            if not choice or choice == "b":
+                break
+
+            try:
+                idx = int(choice) - 1
+                if not (0 <= idx < 3):
+                    raise ValueError
+            except ValueError:
+                self._p("[dim red]pick 1, 2, 3, or b[/dim red]")
+                continue
+
+            current = favs[idx]
+            label = f"slot {idx + 1}"
+            if current:
+                label += f" (current: {current}, blank to remove)"
+            new_val = (await self._simple_prompt(f"{label} › ")).strip()
+
+            if new_val == "":
+                # Empty input → clear the slot
+                favs[idx] = ""
+                self._p(f"[green]✓ slot {idx + 1} cleared[/green]")
+            else:
+                favs[idx] = new_val
+                self._p(f"[green]✓ slot {idx + 1}:[/green] {new_val}")
+
+            # Persist immediately on each change
+            cleaned = [m for m in favs if m]  # don't store empty slots in toml
+            self._save_config_key("openrouter", "favorite_models", cleaned)
+            self._kernel.config.setdefault("openrouter", {})["favorite_models"] = cleaned
+
+    async def _simple_prompt(self, label: str, is_password: bool = False) -> str:
+        """Quick non-framed prompt for /config sub-questions."""
+        from prompt_toolkit import PromptSession
+        sess = PromptSession()
         try:
-            result = await self._session.prompt_async(text, is_password=is_password)
-            return result or ""
+            return await sess.prompt_async(label, is_password=is_password)
         except (KeyboardInterrupt, EOFError):
             return ""
 
@@ -380,8 +604,8 @@ class CLIPlugin(AtlasPlugin):
         await proc.wait()
         self._p(f"[green]✓ closed editor[/green]")
 
-    def _save_config_key(self, section: str, key: str, value: str) -> None:
-        """Persist a value to config.toml, creating the file if missing."""
+    def _save_config_key(self, section: str, key: str, value) -> None:
+        """Persist a config value (str, list, bool, etc.) to config.toml."""
         if CONFIG_PATH.exists():
             with open(CONFIG_PATH, "rb") as f:
                 cfg = tomllib.load(f)
@@ -415,7 +639,6 @@ class CLIPlugin(AtlasPlugin):
         remotes = await self._git("remote")
         if not remotes:
             self._p("[yellow]⚠  no git remote configured.[/yellow]")
-            self._p("[dim]   add one with: git remote add origin <url>[/dim]")
             return
 
         with self._console.status("[dim]checking for updates...[/dim]", spinner="dots"):
@@ -425,7 +648,6 @@ class CLIPlugin(AtlasPlugin):
 
         if not remote:
             self._p("[yellow]⚠  no upstream branch set.[/yellow]")
-            self._p("[dim]   push first: git push -u origin main[/dim]")
             return
 
         if local == remote:
@@ -472,22 +694,6 @@ class CLIPlugin(AtlasPlugin):
         except Exception as e:
             return {"returncode": 1, "stdout": "", "stderr": str(e)}
 
-    # ── input ─────────────────────────────────────────────────────────────
-
-    async def _get_input(self):
-        try:
-            return await self._session.prompt_async(
-                HTML(
-                    '<style fg="ansicyan" bold="true">◈</style> '
-                    '<style bold="true">atlas</style> '
-                    '<style fg="ansibrightblack">›</style> '
-                ),
-            )
-        except EOFError:
-            return None
-        except KeyboardInterrupt:
-            return ""
-
     # ── main loop ─────────────────────────────────────────────────────────
 
     async def _run(self) -> None:
@@ -504,22 +710,24 @@ class CLIPlugin(AtlasPlugin):
             if not user_input.strip():
                 continue
 
+            # Echo what the user submitted so the conversation flow is visible
+            # (since erase_when_done=True clears the framed box on submit)
+            self._console.print(f"[bold cyan]›[/bold cyan] {user_input}")
+
             if user_input.startswith("/"):
                 handled = await self._handle_command(user_input)
                 if not handled:
                     self._p(f"[dim red]unknown command. type /help for a list.[/dim red]")
                 continue
 
-            # Tight spacing: one blank line between user and assistant blocks
             self._p()
             try:
-                with patch_stdout():
-                    await agent.process(
-                        user_input,
-                        on_token=self.stream_token,
-                        on_tool_call=self.show_tool_call,
-                    )
+                await agent.process(
+                    user_input,
+                    on_token=self.stream_token,
+                    on_tool_call=self.show_tool_call,
+                )
             except Exception as e:
                 self._p(f"\n[bold red][error: {e}][/bold red]")
 
-            self._p()  # one trailing blank line, not two
+            self._p()
