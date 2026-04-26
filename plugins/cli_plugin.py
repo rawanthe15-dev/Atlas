@@ -199,6 +199,8 @@ class CLIPlugin(AtlasPlugin):
         self._processor_task: Optional[asyncio.Task] = None
         self._current_process_task: Optional[asyncio.Task] = None  # the in-flight LLM call
         self._is_processing = False  # toolbar shows "thinking..." when True
+        self._showed_thinking_header = False  # reset per turn — prefix once before reasoning stream
+        self._showed_response_header = False  # reset per turn — newline boundary between reasoning and answer
 
     # ── favorites accessors ───────────────────────────────────────────────
 
@@ -251,13 +253,40 @@ class CLIPlugin(AtlasPlugin):
     def _p(self, text: str = "", style: str = "") -> None:
         self._console.print(text, style=style, end="\n")
 
+    async def stream_reasoning(self, token: str) -> None:
+        """Print reasoning tokens dimly, prefixed once with a '✦ thinking' header."""
+        if not self._showed_thinking_header:
+            self._console.print("[dim italic]✦ thinking[/dim italic]", style="")
+            self._showed_thinking_header = True
+        self._console.print(f"[dim italic]{token}[/dim italic]", end="", highlight=False)
+
     async def stream_token(self, token: str) -> None:
+        # If we were streaming reasoning, draw a separator before the actual answer
+        if self._showed_thinking_header and not self._showed_response_header:
+            self._console.print()
+            self._console.print()
+            self._showed_response_header = True
         self._console.print(token, end="", highlight=False)
 
     async def show_tool_call(self, tool_name: str) -> None:
         self._console.print(f"\n[dim]\\[calling: {tool_name}...][/dim]")
 
-    # ── animated startup ───────────────────────────────────────────────────
+    # ── banners ────────────────────────────────────────────────────────────
+
+    async def _render_banner_static(self) -> None:
+        """Plain non-animated banner — safe to call while the persistent
+        Application is running (no asyncio.sleep, no rich.status spinner)."""
+        art = ATLAS_ART if _is_utf8() else ATLAS_ART_ASCII
+        version = self._kernel.config.get("atlas", {}).get("version", "0.1.0")
+        model = self._kernel.config.get("openrouter", {}).get("default_model", "unknown")
+
+        gradient = ["cyan", "bright_cyan", "cyan", "bright_blue", "blue", "blue"]
+        self._console.print()
+        for line, color in zip(art, gradient):
+            self._console.print(line, style=f"bold {color}")
+        self._console.print()
+        self._console.print("          your second brain", style="dim italic")
+        self._console.print(f"          v{version}  ·  {model}\n", style="dim")
 
     async def _render_startup(self) -> None:
         art = ATLAS_ART if _is_utf8() else ATLAS_ART_ASCII
@@ -481,8 +510,12 @@ class CLIPlugin(AtlasPlugin):
             return True
 
         if cmd == "/clear":
-            self._console.clear()
-            await self._render_startup()
+            # console.clear() conflicts with the persistent Application's render
+            # tracking and corrupts the input box width on next render. Use the
+            # Application's own renderer.clear() and a minimal banner reprint.
+            if self._app and self._app.renderer:
+                self._app.renderer.clear()
+            await self._render_banner_static()
             return True
 
         if cmd == "/exit":
@@ -821,12 +854,15 @@ class CLIPlugin(AtlasPlugin):
                     continue
 
                 self._is_processing = True
+                self._showed_thinking_header = False
+                self._showed_response_header = False
                 self._p()
                 self._current_process_task = asyncio.create_task(
                     agent.process(
                         user_input,
                         on_token=self.stream_token,
                         on_tool_call=self.show_tool_call,
+                        on_reasoning=self.stream_reasoning,
                     )
                 )
                 try:

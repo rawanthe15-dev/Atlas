@@ -86,6 +86,7 @@ class AgentPlugin(AtlasPlugin):
         user_input: str,
         on_token: Optional[Callable[[str], Union[None, Awaitable[None]]]] = None,
         on_tool_call: Optional[Callable[[str], Union[None, Awaitable[None]]]] = None,
+        on_reasoning: Optional[Callable[[str], Union[None, Awaitable[None]]]] = None,
     ) -> str:
         system_prompt = await self._build_system_prompt(user_input)
         messages = [{"role": "system", "content": system_prompt}]
@@ -106,6 +107,11 @@ class AgentPlugin(AtlasPlugin):
                     tokens.append(content)
                     if on_token:
                         result = on_token(content)
+                        if asyncio.iscoroutine(result):
+                            await result
+                elif event_type == "reasoning":
+                    if on_reasoning:
+                        result = on_reasoning(content)
                         if asyncio.iscoroutine(result):
                             await result
                 elif event_type == "tool_call":
@@ -171,7 +177,7 @@ class AgentPlugin(AtlasPlugin):
         return full_response
 
     async def _stream(self, messages: List[dict], tools: List[dict]):
-        """Async generator yielding ("token", str) or ("tool_call", dict)."""
+        """Async generator yielding ("token", str), ("reasoning", str), or ("tool_call", dict)."""
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
@@ -201,6 +207,12 @@ class AgentPlugin(AtlasPlugin):
 
                     choices = chunk.get("choices") or [{}]
                     delta = choices[0].get("delta", {})
+
+                    # Reasoning trace (DeepSeek-R1, Claude with extended thinking, etc.)
+                    # Different providers use different field names — accept both.
+                    reasoning_chunk = delta.get("reasoning") or delta.get("reasoning_content")
+                    if reasoning_chunk:
+                        yield ("reasoning", reasoning_chunk)
 
                     if delta.get("content"):
                         yield ("token", delta["content"])
