@@ -276,45 +276,20 @@ class CLIPlugin(AtlasPlugin):
 
     async def stream_token(self, token: str) -> None:
         """Stream tokens live, re-rendering the accumulated buffer as markdown
-        in place via rich.Live. The user sees rendered output (bold, code blocks,
-        lists, headings) progressively — never the raw `**markers**`.
-
-        We drive refresh manually because rich.Live's auto-refresh thread
-        doesn't cooperate with prompt_toolkit's patch_stdout — its writes get
-        buffered and only flush when the app redraws. So after every token we
-        force a Live refresh AND invalidate the app to flush the buffer."""
-        # If we were streaming reasoning, drop a blank line so the answer block
-        # starts cleanly below the thinking trace.
+        in place via rich.Live. The user sees rendered output (bold, code
+        blocks, lists, headings) progressively — never raw `**markers**`."""
         if self._showed_thinking_header and not self._showed_response_header:
             self._console.print()
             self._console.print()
             self._showed_response_header = True
         self._response_buffer += token
         if self._live is not None:
-            # Always render through Markdown — plain prose renders identically,
-            # but as soon as a complete `**bold**` or ` ```fence ``` ` appears,
-            # it'll flip to formatted in place.
             try:
-                self._live.update(
-                    Markdown(self._response_buffer, code_theme="monokai"),
-                    refresh=False,
-                )
+                self._live.update(Markdown(self._response_buffer, code_theme="monokai"))
             except Exception:
-                # Partial fences / unbalanced markers can crash the parser
+                # Partial fences / unbalanced markers crash the parser
                 # mid-stream — fall back to plain text for this tick.
-                self._live.update(Text(self._response_buffer), refresh=False)
-            try:
-                self._live.refresh()
-            except Exception:
-                pass
-        # Force prompt_toolkit to flush its stdout proxy so the Live frame
-        # actually appears on screen. Without this, output gets buffered and
-        # only displayed when the app redraws on its own (often: end of turn).
-        if self._app is not None:
-            try:
-                self._app.invalidate()
-            except Exception:
-                pass
+                self._live.update(Text(self._response_buffer))
 
     async def show_tool_call(self, tool_name: str) -> None:
         self._console.print(f"\n[dim]\\[calling: {tool_name}...][/dim]")
@@ -882,49 +857,52 @@ class CLIPlugin(AtlasPlugin):
     # ── persistent processor loop ─────────────────────────────────────────
 
     async def _processor_loop(self) -> None:
-        """Drains submitted inputs from the queue. Runs concurrently with the live UI.
-        patch_stdout(raw=True) routes all stdout writes (rich.print, streaming tokens)
-        to appear ABOVE the live framed input box, which stays visible the whole time."""
+        """Drains submitted inputs from the queue.
+
+        For LLM streaming we suspend the framed app via in_terminal() so
+        rich.Live owns the terminal directly. patch_stdout swallows Live's
+        cursor-up re-renders, which is why streaming wasn't visible until
+        end of turn. The input box hides during the stream and reappears
+        the moment the response completes — same pattern Claude Code uses."""
         agent = self._kernel.get_plugin("agent")
 
-        with patch_stdout(raw=True):
-            while self._running:
-                try:
-                    user_input = await asyncio.wait_for(
-                        self._input_queue.get(), timeout=0.5
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                except asyncio.CancelledError:
-                    break
+        while self._running:
+            try:
+                user_input = await asyncio.wait_for(
+                    self._input_queue.get(), timeout=0.5
+                )
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
 
-                # Echo the submission so the conversation history scrolls up cleanly
-                self._console.print(f"\n[bold cyan]›[/bold cyan] {user_input}")
-
-                if user_input.startswith("/"):
+            # Echo + slash commands: keep the framed input visible.
+            if user_input.startswith("/"):
+                with patch_stdout(raw=True):
+                    self._console.print(f"\n[bold cyan]›[/bold cyan] {user_input}")
                     try:
                         handled = await self._handle_command(user_input)
                         if not handled:
                             self._p("[dim red]unknown command. type /help[/dim red]")
                     except Exception as e:
                         self._p(f"[bold red]command error: {e}[/bold red]")
-                    continue
+                continue
 
-                self._is_processing = True
-                self._showed_thinking_header = False
-                self._showed_response_header = False
-                self._response_buffer = ""
-                self._p()
+            self._is_processing = True
+            self._showed_thinking_header = False
+            self._showed_response_header = False
+            self._response_buffer = ""
 
-                # rich.Live re-renders the accumulated buffer in place each tick.
-                # auto_refresh handles redraw cadence; we update on each token.
-                # auto_refresh=False — we drive refresh manually from
-                # stream_token to coordinate flushing with prompt_toolkit.
+            # Suspend the app so rich.Live can take the terminal directly.
+            async with in_terminal():
+                self._console.print(f"\n[bold cyan]›[/bold cyan] {user_input}")
+                self._console.print()
                 with Live(
                     Text(""),
                     console=self._console,
                     transient=False,
-                    auto_refresh=False,
+                    refresh_per_second=20,
+                    auto_refresh=True,
                 ) as live:
                     self._live = live
                     self._current_process_task = asyncio.create_task(
@@ -945,4 +923,4 @@ class CLIPlugin(AtlasPlugin):
                         self._current_process_task = None
                         self._is_processing = False
                         self._live = None
-                self._p()
+                self._console.print()
