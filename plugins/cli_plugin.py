@@ -1,6 +1,5 @@
 import asyncio
 import os
-import re
 import shutil
 import sys
 from pathlib import Path
@@ -11,22 +10,6 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.rule import Rule
 from rich.text import Text
-
-
-# Regex that detects "this response benefits from markdown rendering"
-MARKDOWN_RE = re.compile(
-    r"(^#{1,6} |^\* |^- |^\d+\. |```|\*\*[^\s*][^*]*\*\*|`[^`]+`|^\| .*\|)",
-    re.MULTILINE,
-)
-
-
-def _looks_like_markdown(text: str) -> bool:
-    """Cheap heuristic: render markdown only when it'll add real value."""
-    if "\n" not in text:
-        return False
-    if len(text) < 100:
-        return False
-    return bool(MARKDOWN_RE.search(text))
 
 from functools import partial
 
@@ -294,7 +277,12 @@ class CLIPlugin(AtlasPlugin):
     async def stream_token(self, token: str) -> None:
         """Stream tokens live, re-rendering the accumulated buffer as markdown
         in place via rich.Live. The user sees rendered output (bold, code blocks,
-        lists, headings) progressively — never the raw `**markers**`."""
+        lists, headings) progressively — never the raw `**markers**`.
+
+        We drive refresh manually because rich.Live's auto-refresh thread
+        doesn't cooperate with prompt_toolkit's patch_stdout — its writes get
+        buffered and only flush when the app redraws. So after every token we
+        force a Live refresh AND invalidate the app to flush the buffer."""
         # If we were streaming reasoning, drop a blank line so the answer block
         # starts cleanly below the thinking trace.
         if self._showed_thinking_header and not self._showed_response_header:
@@ -303,15 +291,30 @@ class CLIPlugin(AtlasPlugin):
             self._showed_response_header = True
         self._response_buffer += token
         if self._live is not None:
+            # Always render through Markdown — plain prose renders identically,
+            # but as soon as a complete `**bold**` or ` ```fence ``` ` appears,
+            # it'll flip to formatted in place.
             try:
                 self._live.update(
-                    Markdown(self._response_buffer, code_theme="monokai")
-                    if _looks_like_markdown(self._response_buffer)
-                    else Text(self._response_buffer)
+                    Markdown(self._response_buffer, code_theme="monokai"),
+                    refresh=False,
                 )
             except Exception:
-                # Markdown parse can fail mid-stream on partial fences; show plain meanwhile
-                self._live.update(Text(self._response_buffer))
+                # Partial fences / unbalanced markers can crash the parser
+                # mid-stream — fall back to plain text for this tick.
+                self._live.update(Text(self._response_buffer), refresh=False)
+            try:
+                self._live.refresh()
+            except Exception:
+                pass
+        # Force prompt_toolkit to flush its stdout proxy so the Live frame
+        # actually appears on screen. Without this, output gets buffered and
+        # only displayed when the app redraws on its own (often: end of turn).
+        if self._app is not None:
+            try:
+                self._app.invalidate()
+            except Exception:
+                pass
 
     async def show_tool_call(self, tool_name: str) -> None:
         self._console.print(f"\n[dim]\\[calling: {tool_name}...][/dim]")
@@ -915,12 +918,13 @@ class CLIPlugin(AtlasPlugin):
 
                 # rich.Live re-renders the accumulated buffer in place each tick.
                 # auto_refresh handles redraw cadence; we update on each token.
+                # auto_refresh=False — we drive refresh manually from
+                # stream_token to coordinate flushing with prompt_toolkit.
                 with Live(
                     Text(""),
                     console=self._console,
-                    refresh_per_second=10,
                     transient=False,
-                    auto_refresh=True,
+                    auto_refresh=False,
                 ) as live:
                     self._live = live
                     self._current_process_task = asyncio.create_task(
