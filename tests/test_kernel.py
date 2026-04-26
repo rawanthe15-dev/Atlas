@@ -70,3 +70,30 @@ async def test_kernel_unload_all():
     await k.unload_all()
     assert "fake" in unloaded
     assert k._plugins == {}
+
+
+# --- Plugin integration tests ---
+from plugins.config_plugin import ConfigPlugin
+from plugins.memory_plugin import MemoryPlugin
+
+
+@pytest.mark.asyncio
+async def test_config_plugin_sets_defaults(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-123")
+    k = Kernel()
+    await k.load_plugin(ConfigPlugin)
+    assert k.config["openrouter"]["api_key"] == "test-key-123"
+    assert k.config["openrouter"]["default_model"] == "deepseek/deepseek-chat"
+
+
+@pytest.mark.asyncio
+async def test_memory_plugin_wires_backend(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    k = Kernel()
+    k.config = {"memory": {"backend": "file", "path": str(tmp_path / "memory")}}
+    await k.load_plugin(MemoryPlugin)
+    assert k.memory is not None
+    await k.memory.write("test fact", tags=["test"])
+    results = await k.memory.search("test fact")
+    assert len(results) >= 1
