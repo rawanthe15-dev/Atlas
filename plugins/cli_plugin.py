@@ -7,8 +7,10 @@ from pathlib import Path
 from typing import Optional
 
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.rule import Rule
+from rich.text import Text
 
 
 # Regex that detects "this response benefits from markdown rendering"
@@ -219,7 +221,8 @@ class CLIPlugin(AtlasPlugin):
         self._is_processing = False  # toolbar shows "thinking..." when True
         self._showed_thinking_header = False  # reset per turn — prefix once before reasoning stream
         self._showed_response_header = False  # reset per turn — newline boundary between reasoning and answer
-        self._response_buffer = ""             # accumulates tokens to optionally re-render as markdown
+        self._response_buffer = ""             # accumulates tokens; live-rendered as markdown
+        self._live: Optional[Live] = None      # rich.Live context — updated per token
 
     # ── favorites accessors ───────────────────────────────────────────────
 
@@ -289,8 +292,9 @@ class CLIPlugin(AtlasPlugin):
         self._console.print(f"[dim italic]{token}[/dim italic]", end="", highlight=False)
 
     async def stream_token(self, token: str) -> None:
-        """Buffer the token silently. The full response is rendered once after
-        generation completes — avoids the raw-text + rendered-markdown duplicate."""
+        """Stream tokens live, re-rendering the accumulated buffer as markdown
+        in place via rich.Live. The user sees rendered output (bold, code blocks,
+        lists, headings) progressively — never the raw `**markers**`."""
         # If we were streaming reasoning, drop a blank line so the answer block
         # starts cleanly below the thinking trace.
         if self._showed_thinking_header and not self._showed_response_header:
@@ -298,6 +302,16 @@ class CLIPlugin(AtlasPlugin):
             self._console.print()
             self._showed_response_header = True
         self._response_buffer += token
+        if self._live is not None:
+            try:
+                self._live.update(
+                    Markdown(self._response_buffer, code_theme="monokai")
+                    if _looks_like_markdown(self._response_buffer)
+                    else Text(self._response_buffer)
+                )
+            except Exception:
+                # Markdown parse can fail mid-stream on partial fences; show plain meanwhile
+                self._live.update(Text(self._response_buffer))
 
     async def show_tool_call(self, tool_name: str) -> None:
         self._console.print(f"\n[dim]\\[calling: {tool_name}...][/dim]")
@@ -898,37 +912,33 @@ class CLIPlugin(AtlasPlugin):
                 self._showed_response_header = False
                 self._response_buffer = ""
                 self._p()
-                self._current_process_task = asyncio.create_task(
-                    agent.process(
-                        user_input,
-                        on_token=self.stream_token,
-                        on_tool_call=self.show_tool_call,
-                        on_reasoning=self.stream_reasoning,
-                    )
-                )
-                try:
-                    await self._current_process_task
-                except asyncio.CancelledError:
-                    self._p("\n[yellow]⎯ interrupted (esc) ⎯[/yellow]")
-                except Exception as e:
-                    self._p(f"\n[bold red][error: {e}][/bold red]")
-                finally:
-                    self._current_process_task = None
-                    self._is_processing = False
 
-                # Print the response ONCE — rendered markdown if it has structure,
-                # plain text otherwise. (Tokens were silently buffered during stream
-                # so the markdown markers like **bold** never appeared raw.)
-                if self._response_buffer.strip():
+                # rich.Live re-renders the accumulated buffer in place each tick.
+                # auto_refresh handles redraw cadence; we update on each token.
+                with Live(
+                    Text(""),
+                    console=self._console,
+                    refresh_per_second=10,
+                    transient=False,
+                    auto_refresh=True,
+                ) as live:
+                    self._live = live
+                    self._current_process_task = asyncio.create_task(
+                        agent.process(
+                            user_input,
+                            on_token=self.stream_token,
+                            on_tool_call=self.show_tool_call,
+                            on_reasoning=self.stream_reasoning,
+                        )
+                    )
                     try:
-                        if _looks_like_markdown(self._response_buffer):
-                            self._console.print(
-                                Markdown(self._response_buffer, code_theme="monokai")
-                            )
-                        else:
-                            self._console.print(self._response_buffer)
-                    except Exception:
-                        # Markdown parsing failed — fall back to plain text so the
-                        # response is never lost.
-                        self._console.print(self._response_buffer)
+                        await self._current_process_task
+                    except asyncio.CancelledError:
+                        live.update(Text(self._response_buffer + "\n[interrupted]"))
+                    except Exception as e:
+                        live.update(Text(f"{self._response_buffer}\n[error: {e}]"))
+                    finally:
+                        self._current_process_task = None
+                        self._is_processing = False
+                        self._live = None
                 self._p()
