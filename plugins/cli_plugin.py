@@ -289,13 +289,15 @@ class CLIPlugin(AtlasPlugin):
         self._console.print(f"[dim italic]{token}[/dim italic]", end="", highlight=False)
 
     async def stream_token(self, token: str) -> None:
-        # If we were streaming reasoning, draw a separator before the actual answer
+        """Buffer the token silently. The full response is rendered once after
+        generation completes — avoids the raw-text + rendered-markdown duplicate."""
+        # If we were streaming reasoning, drop a blank line so the answer block
+        # starts cleanly below the thinking trace.
         if self._showed_thinking_header and not self._showed_response_header:
             self._console.print()
             self._console.print()
             self._showed_response_header = True
         self._response_buffer += token
-        self._console.print(token, end="", highlight=False)
 
     async def show_tool_call(self, tool_name: str) -> None:
         self._console.print(f"\n[dim]\\[calling: {tool_name}...][/dim]")
@@ -914,15 +916,19 @@ class CLIPlugin(AtlasPlugin):
                     self._current_process_task = None
                     self._is_processing = False
 
-                # Re-render the response as markdown if it has structure worth formatting
-                if _looks_like_markdown(self._response_buffer):
-                    self._console.print()
-                    self._console.rule(style="#3a4a5a", characters="─")
+                # Print the response ONCE — rendered markdown if it has structure,
+                # plain text otherwise. (Tokens were silently buffered during stream
+                # so the markdown markers like **bold** never appeared raw.)
+                if self._response_buffer.strip():
                     try:
-                        self._console.print(
-                            Markdown(self._response_buffer, code_theme="monokai")
-                        )
+                        if _looks_like_markdown(self._response_buffer):
+                            self._console.print(
+                                Markdown(self._response_buffer, code_theme="monokai")
+                            )
+                        else:
+                            self._console.print(self._response_buffer)
                     except Exception:
-                        # If markdown parsing fails for any reason, the raw stream above is still visible
-                        pass
+                        # Markdown parsing failed — fall back to plain text so the
+                        # response is never lost.
+                        self._console.print(self._response_buffer)
                 self._p()
