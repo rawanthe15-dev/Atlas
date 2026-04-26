@@ -11,15 +11,18 @@ from rich.rule import Rule
 from functools import partial
 
 from prompt_toolkit.application import Application
+from prompt_toolkit.application.run_in_terminal import run_in_terminal
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout
-from prompt_toolkit.layout.containers import HSplit, VSplit, Window
+from prompt_toolkit.layout.containers import Float, FloatContainer, HSplit, VSplit, Window
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
@@ -181,6 +184,11 @@ class CLIPlugin(AtlasPlugin):
             favorites_getter=self._get_favorite_models,
             current_model_getter=self._get_current_model,
         )
+        self._input_queue: Optional[asyncio.Queue] = None
+        self._app: Optional[Application] = None
+        self._text_area: Optional[TextArea] = None
+        self._processor_task: Optional[asyncio.Task] = None
+        self._is_processing = False  # toolbar shows "thinking..." when True
 
     # ── favorites accessors ───────────────────────────────────────────────
 
@@ -200,10 +208,33 @@ class CLIPlugin(AtlasPlugin):
     async def load(self, kernel) -> None:
         self._kernel = kernel
         self._running = True
-        await self._run()
+        self._input_queue = asyncio.Queue()
+
+        # Print the static startup banner first (via normal stdout, no live area yet)
+        await self._render_startup()
+
+        # Build the persistent input application
+        self._app = self._build_persistent_app()
+
+        # Start the processor coroutine that drains the input queue
+        self._processor_task = asyncio.create_task(self._processor_loop())
+
+        # Run the application — blocks until /exit or Ctrl-D
+        try:
+            await self._app.run_async()
+        finally:
+            self._running = False
+            if self._processor_task and not self._processor_task.done():
+                self._processor_task.cancel()
+                try:
+                    await self._processor_task
+                except asyncio.CancelledError:
+                    pass
 
     async def unload(self) -> None:
         self._running = False
+        if self._app and self._app.is_running:
+            self._app.exit()
 
     # ── rendering helpers ──────────────────────────────────────────────────
 
@@ -256,16 +287,31 @@ class CLIPlugin(AtlasPlugin):
         n = len(agent._history) // 2
         api_set = bool(cfg.get("api_key"))
         dot = ("class:toolbar.accent", "●") if api_set else ("class:toolbar.warn", "○")
+        status = (
+            ("class:toolbar.accent", "thinking…")
+            if self._is_processing
+            else ("class:toolbar", f"{n} exchange{'s' if n != 1 else ''}")
+        )
         return [
             ("class:toolbar", "  "),
             dot,
-            ("class:toolbar", f"  {model}  ·  {n} exchange{'s' if n != 1 else ''}  ·  type "),
+            ("class:toolbar", f"  {model}  ·  "),
+            status,
+            ("class:toolbar", "  ·  type "),
             ("class:toolbar.accent", "/"),
             ("class:toolbar", " for commands"),
         ]
 
-    def _build_input_app(self) -> tuple:
-        """Build a fresh Application around a framed TextArea and return (app, text_area)."""
+    def _on_accept(self, buffer):
+        """Called when the user hits Enter — push to queue, clear input, keep app alive."""
+        text = buffer.text
+        if text.strip():
+            self._input_queue.put_nowait(text)
+        buffer.reset()
+        return False  # False keeps the app running
+
+    def _build_persistent_app(self) -> Application:
+        """Build the long-lived Application that owns the input box."""
         text_area = TextArea(
             multiline=False,
             wrap_lines=True,
@@ -275,22 +321,25 @@ class CLIPlugin(AtlasPlugin):
             scrollbar=False,
             style="class:input",
             prompt="◈ ",
+            accept_handler=self._on_accept,
         )
+        self._text_area = text_area
 
         kb = KeyBindings()
-
-        @kb.add("enter")
-        def _(event):
-            event.app.exit(result=text_area.text)
-
-        @kb.add("c-c")
-        def _(event):
-            event.app.exit(result="")
 
         @kb.add("c-d")
         def _(event):
             if not text_area.text:
-                event.app.exit(result=None)
+                self._running = False
+                event.app.exit()
+
+        @kb.add("c-c")
+        def _(event):
+            if text_area.text:
+                text_area.buffer.reset()
+            else:
+                self._running = False
+                event.app.exit()
 
         framed = rounded_frame(text_area)
         toolbar = Window(
@@ -299,25 +348,25 @@ class CLIPlugin(AtlasPlugin):
             style="class:toolbar",
         )
 
-        layout = Layout(HSplit([framed, toolbar]))
+        # Wrap in FloatContainer so the completion dropdown can render above the frame
+        root = FloatContainer(
+            content=HSplit([framed, toolbar]),
+            floats=[
+                Float(
+                    xcursor=True,
+                    ycursor=True,
+                    content=CompletionsMenu(max_height=10, scroll_offset=1),
+                ),
+            ],
+        )
 
-        app = Application(
-            layout=layout,
+        return Application(
+            layout=Layout(root),
             key_bindings=kb,
             full_screen=False,
-            erase_when_done=True,
             style=INPUT_STYLE,
             mouse_support=False,
         )
-        return app, text_area
-
-    async def _get_input(self):
-        """Run the framed input app, return the submitted text (or None on EOF)."""
-        app, text_area = self._build_input_app()
-        try:
-            return await app.run_async()
-        except (EOFError, KeyboardInterrupt):
-            return None
 
     # ── command handling ───────────────────────────────────────────────────
 
@@ -334,7 +383,8 @@ class CLIPlugin(AtlasPlugin):
             return True
 
         if cmd == "/config":
-            await self._handle_config()
+            # Suspend live rendering so the interactive sub-prompts can take stdin
+            await run_in_terminal(self._handle_config)
             return True
 
         if cmd == "/memory":
@@ -362,8 +412,8 @@ class CLIPlugin(AtlasPlugin):
                 self._kernel.config["openrouter"]["default_model"] = arg
                 self._p(f"[green]✓ model:[/green] {arg}")
             else:
-                # No arg → show favorites with numeric pick + "type a new name" option
-                await self._pick_model_interactive()
+                # Interactive picker — needs stdin, suspend live rendering
+                await run_in_terminal(self._pick_model_interactive)
             return True
 
         if cmd == "/sessions":
@@ -393,8 +443,10 @@ class CLIPlugin(AtlasPlugin):
             return True
 
         if cmd == "/exit":
-            self._running = False
             self._p("[dim]atlas signing off.[/dim]")
+            self._running = False
+            if self._app and self._app.is_running:
+                self._app.exit()
             return True
 
         return False
@@ -694,40 +746,47 @@ class CLIPlugin(AtlasPlugin):
         except Exception as e:
             return {"returncode": 1, "stdout": "", "stderr": str(e)}
 
-    # ── main loop ─────────────────────────────────────────────────────────
+    # ── persistent processor loop ─────────────────────────────────────────
 
-    async def _run(self) -> None:
-        await self._render_startup()
+    async def _processor_loop(self) -> None:
+        """Drains submitted inputs from the queue. Runs concurrently with the live UI.
+        patch_stdout(raw=True) routes all stdout writes (rich.print, streaming tokens)
+        to appear ABOVE the live framed input box, which stays visible the whole time."""
         agent = self._kernel.get_plugin("agent")
 
-        while self._running:
-            user_input = await self._get_input()
+        with patch_stdout(raw=True):
+            while self._running:
+                try:
+                    user_input = await asyncio.wait_for(
+                        self._input_queue.get(), timeout=0.5
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    break
 
-            if user_input is None:
-                self._p("[dim]atlas signing off.[/dim]")
-                break
+                # Echo the submission so the conversation history scrolls up cleanly
+                self._console.print(f"\n[bold cyan]›[/bold cyan] {user_input}")
 
-            if not user_input.strip():
-                continue
+                if user_input.startswith("/"):
+                    try:
+                        handled = await self._handle_command(user_input)
+                        if not handled:
+                            self._p("[dim red]unknown command. type /help[/dim red]")
+                    except Exception as e:
+                        self._p(f"[bold red]command error: {e}[/bold red]")
+                    continue
 
-            # Echo what the user submitted so the conversation flow is visible
-            # (since erase_when_done=True clears the framed box on submit)
-            self._console.print(f"[bold cyan]›[/bold cyan] {user_input}")
-
-            if user_input.startswith("/"):
-                handled = await self._handle_command(user_input)
-                if not handled:
-                    self._p(f"[dim red]unknown command. type /help for a list.[/dim red]")
-                continue
-
-            self._p()
-            try:
-                await agent.process(
-                    user_input,
-                    on_token=self.stream_token,
-                    on_tool_call=self.show_tool_call,
-                )
-            except Exception as e:
-                self._p(f"\n[bold red][error: {e}][/bold red]")
-
-            self._p()
+                self._is_processing = True
+                self._p()
+                try:
+                    await agent.process(
+                        user_input,
+                        on_token=self.stream_token,
+                        on_tool_call=self.show_tool_call,
+                    )
+                except Exception as e:
+                    self._p(f"\n[bold red][error: {e}][/bold red]")
+                finally:
+                    self._is_processing = False
+                self._p()

@@ -121,7 +121,9 @@ async def test_tools_plugin_loads_all_tools(tmp_path, monkeypatch):
     assert "write_file" in names
     assert "remember" in names
     assert "recall" in names
+    assert "get_user_profile" in names
+    assert "update_user_profile" in names
     # Verify schemas are exposed
     schemas = tools_plugin.schemas()
-    assert len(schemas) == 6
+    assert len(schemas) == 8
     assert all("function" in s for s in schemas)

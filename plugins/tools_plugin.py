@@ -3,7 +3,7 @@ from .base import AtlasPlugin
 from tools.shell_tool import ShellTool
 from tools.filesystem_tool import ReadFileTool, WriteFileTool
 from tools.web_search_tool import WebSearchTool
-from tools.memory_tools import RememberTool, RecallTool
+from tools.memory_tools import RememberTool, RecallTool, UpdateProfileTool, GetProfileTool
 from tools.base import Tool
 
 
@@ -22,6 +22,8 @@ class ToolsPlugin(AtlasPlugin):
             WebSearchTool(api_key=cfg.get("brave_api_key", "")),
             RememberTool(kernel.memory),
             RecallTool(kernel.memory),
+            GetProfileTool(kernel.memory),
+            UpdateProfileTool(kernel.memory),
         ]
         for tool in tools:
             self._registry[tool.name] = tool
