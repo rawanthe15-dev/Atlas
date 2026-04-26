@@ -287,59 +287,21 @@ class CLIPlugin(AtlasPlugin):
         self._console.print(text, style=style, end="\n")
 
     async def stream_reasoning(self, token: str) -> None:
-        """Show a 'thinking…' indicator in the streaming Window while the model
-        reasons. We don't show every reasoning token (too noisy) — just a
-        steady marker that flips to the actual response when it arrives."""
         if not self._showed_thinking_header:
-            self._streaming_buffer = "*✦ thinking…*"
+            self._console.print("[dim italic]✦ thinking[/dim italic]")
             self._showed_thinking_header = True
-            if self._app is not None:
-                try:
-                    self._app.invalidate()
-                except Exception:
-                    pass
+        self._console.print(token, end="", highlight=False, soft_wrap=True)
 
     async def stream_token(self, token: str) -> None:
-        """Append the token to the streaming buffer and trigger an app redraw.
-        prompt_toolkit will re-call _streaming_text() during the redraw, which
-        re-renders the full buffer as markdown. As soon as a closing `**`
-        arrives in the stream, the rendered output flips to bold in place."""
-        # First response token after reasoning → drop the thinking indicator.
         if self._showed_thinking_header and not self._showed_response_header:
-            self._streaming_buffer = ""
+            self._console.print()
+            self._console.print()
             self._showed_response_header = True
         self._response_buffer += token
-        self._streaming_buffer += token
-        if self._app is not None:
-            try:
-                self._app.invalidate()
-            except Exception:
-                pass
-
-    def _streaming_text(self):
-        """Live markdown render of the in-progress response.
-        Called by prompt_toolkit on every redraw. We render the current buffer
-        through rich.Markdown into a captured ANSI string, which the
-        FormattedTextControl displays as colored, bold-aware output."""
-        if not self._streaming_buffer:
-            return ""
-        # Match the render width to the terminal so wrapping is correct.
-        try:
-            width = shutil.get_terminal_size((80, 24)).columns
-            self._render_console.width = max(20, width)
-        except Exception:
-            pass
-        with self._render_console.capture() as cap:
-            try:
-                self._render_console.print(
-                    Markdown(self._streaming_buffer, code_theme="monokai"),
-                    end="",
-                )
-            except Exception:
-                # Partial fences / unbalanced markers can crash the parser
-                # mid-stream — fall back to plain text for this tick.
-                self._render_console.print(self._streaming_buffer, end="")
-        return ANSI(cap.get().rstrip("\n"))
+        # Print the raw token immediately — this goes through patch_stdout's
+        # proxy, which flushes to the terminal on the next event-loop tick.
+        # The user sees each token as it arrives (real streaming).
+        self._console.print(token, end="", highlight=False, soft_wrap=True)
 
     async def show_tool_call(self, tool_name: str) -> None:
         self._console.print(f"\n[dim]\\[calling: {tool_name}...][/dim]")
@@ -491,22 +453,9 @@ class CLIPlugin(AtlasPlugin):
             style="class:toolbar",
         )
 
-        # Live streaming area — sits ABOVE the input frame, height auto-fits
-        # the rendered markdown. prompt_toolkit redraws this natively on each
-        # invalidate(), so live in-place markdown rendering "just works".
-        streaming_window = Window(
-            FormattedTextControl(self._streaming_text, focusable=False),
-            wrap_lines=True,
-            dont_extend_height=True,
-        )
-        streaming_area = ConditionalContainer(
-            content=streaming_window,
-            filter=Condition(lambda: bool(self._streaming_buffer)),
-        )
-
         # Wrap in FloatContainer so the completion dropdown can render above the frame
         root = FloatContainer(
-            content=HSplit([streaming_area, framed, toolbar]),
+            content=HSplit([framed, toolbar]),
             floats=[
                 Float(
                     xcursor=True,
@@ -920,87 +869,65 @@ class CLIPlugin(AtlasPlugin):
     # ── persistent processor loop ─────────────────────────────────────────
 
     async def _processor_loop(self) -> None:
-        """Drains submitted inputs from the queue.
-
-        Streaming model:
-        - During the LLM response, tokens flow into self._streaming_buffer
-          and the streaming Window in the app layout re-renders on every
-          app.invalidate(). This gives live in-place markdown rendering
-          while the input box stays visible — no patch_stdout, no
-          in_terminal during the stream.
-        - Non-streaming output (echo, slash command output, final
-          markdown promoted to scroll) is printed via in_terminal() so it
-          lands above the app cleanly. The app briefly suspends and
-          resumes for those — the streaming itself never suspends.
-        """
+        """Drains submitted inputs. All output goes through patch_stdout so
+        it prints above the framed input box. Tokens are written raw as they
+        arrive — the user sees real per-token streaming. When the response
+        finishes, the full markdown render is printed below the raw stream."""
         agent = self._kernel.get_plugin("agent")
 
-        while self._running:
-            try:
-                user_input = await asyncio.wait_for(
-                    self._input_queue.get(), timeout=0.5
-                )
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                break
+        with patch_stdout(raw=True):
+            while self._running:
+                try:
+                    user_input = await asyncio.wait_for(
+                        self._input_queue.get(), timeout=0.5
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    break
 
-            # Echo the user's submission to scroll history.
-            async with in_terminal():
                 self._console.print(f"\n[bold cyan]›[/bold cyan] {user_input}")
 
-            if user_input.startswith("/"):
-                async with in_terminal():
+                if user_input.startswith("/"):
                     try:
                         handled = await self._handle_command(user_input)
                         if not handled:
                             self._p("[dim red]unknown command. type /help[/dim red]")
                     except Exception as e:
                         self._p(f"[bold red]command error: {e}[/bold red]")
-                continue
+                    continue
 
-            self._is_processing = True
-            self._showed_thinking_header = False
-            self._showed_response_header = False
-            self._response_buffer = ""
-            self._streaming_buffer = ""
-            if self._app is not None:
-                self._app.invalidate()
+                self._is_processing = True
+                self._showed_thinking_header = False
+                self._showed_response_header = False
+                self._response_buffer = ""
+                self._p()
 
-            self._current_process_task = asyncio.create_task(
-                agent.process(
-                    user_input,
-                    on_token=self.stream_token,
-                    on_tool_call=self.show_tool_call,
-                    on_reasoning=self.stream_reasoning,
+                self._current_process_task = asyncio.create_task(
+                    agent.process(
+                        user_input,
+                        on_token=self.stream_token,
+                        on_tool_call=self.show_tool_call,
+                        on_reasoning=self.stream_reasoning,
+                    )
                 )
-            )
-            error_msg = None
-            try:
-                await self._current_process_task
-            except asyncio.CancelledError:
-                error_msg = "[interrupted]"
-            except Exception as e:
-                error_msg = f"[error: {e}]"
-            finally:
-                self._current_process_task = None
-                self._is_processing = False
+                try:
+                    await self._current_process_task
+                except asyncio.CancelledError:
+                    self._p("[dim]\n[interrupted][/dim]")
+                except Exception as e:
+                    self._p(f"[dim red]\n[error: {e}][/dim red]")
+                finally:
+                    self._current_process_task = None
+                    self._is_processing = False
 
-            # Promote the live render to scroll history. Collapse the live
-            # area FIRST so the user doesn't briefly see it twice.
-            final_text = self._response_buffer
-            self._streaming_buffer = ""
-            if self._app is not None:
-                self._app.invalidate()
-            if final_text.strip() or error_msg:
-                async with in_terminal():
-                    if final_text.strip():
-                        try:
-                            self._console.print(
-                                Markdown(final_text, code_theme="monokai")
-                            )
-                        except Exception:
-                            self._console.print(final_text)
-                    if error_msg:
-                        self._console.print(f"[dim]{error_msg}[/dim]")
-                    self._console.print()
+                # Raw stream is already on screen. Print clean markdown below it.
+                self._p()
+                if self._response_buffer.strip():
+                    try:
+                        self._console.print(
+                            Markdown(self._response_buffer, code_theme="monokai")
+                        )
+                    except Exception:
+                        pass  # raw stream is already visible, no need to duplicate
+                self._p()
