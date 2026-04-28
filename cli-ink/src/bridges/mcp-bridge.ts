@@ -6,12 +6,17 @@ import { request } from "undici";
 import { Bridge } from "./base.js";
 import { BridgeError, type ToolSpec } from "./types.js";
 
-// Cap the per-content-part text we keep in tool output. Anything larger
-// (typically a base64-encoded image or a giant JSON dump) is offloaded
-// to /tmp and replaced with a short "[saved to /tmp/...]" reference. This
-// stops a single screenshot from dumping ~700kB of tokens into the
-// conversation history.
-const MAX_INLINE_PART_CHARS = 8_000;
+// Caps for inlining tool-result content into conversation history.
+//
+// Text is the agent's main signal — accessibility trees, HTML, search-
+// result extracts. Cap higher so the agent can actually reason about the
+// content it asked for (Google's a11y tree is ~50-200kB; a 8kB cap
+// truncated mid-sidebar and forced the agent to fabricate results).
+//
+// Images/binary go to disk almost immediately — base64 dumps blow the
+// context window and the agent can't read them anyway.
+const MAX_INLINE_TEXT_CHARS = 64_000;   // ≈ 16k tokens
+const MAX_INLINE_BINARY_CHARS = 8_000;  // base64 / json / non-text
 const ATLAS_TMP_DIR = path.join(tmpdir(), "atlas-bridge-output");
 
 async function saveLargeBlob(
@@ -281,31 +286,41 @@ export class MCPBridge extends Bridge {
     const chunks: string[] = [];
     for (const p of parts) {
       if (p?.type === "text" && typeof p.text === "string") {
-        // Even text parts can be huge (a 200kB log dump). Offload anything
-        // over the cap so it doesn't blow the agent's context window.
-        if (p.text.length > MAX_INLINE_PART_CHARS) {
+        // Text is the primary signal — keep generous inline budget so the
+        // agent can actually reason about the content. Only offload truly
+        // large dumps, and even then preserve a substantial head + tell
+        // the agent to read_file for the full document if needed.
+        if (p.text.length > MAX_INLINE_TEXT_CHARS) {
           const file = await saveLargeBlob(p.text, {
             deviceName: this.spec.name, toolName: upstreamName, ext: "txt",
           });
+          const head = p.text.slice(0, MAX_INLINE_TEXT_CHARS - 400);
           chunks.push(
-            `[large text content (${p.text.length} chars) saved to ${file}]\n` +
-            `${p.text.slice(0, 2000)}\n... (truncated; full content in file)`,
+            `[full text (${p.text.length} chars) saved to ${file}; ` +
+            `first ${head.length} chars below — call read_file with that path ` +
+            `to read the rest before answering]\n\n` +
+            `${head}\n\n... (${p.text.length - head.length} more chars in file)`,
           );
         } else {
           chunks.push(p.text);
         }
       } else if (p?.type === "image" && typeof p.data === "string") {
-        // Screenshots etc. — never inline base64 in tool output.
+        // Screenshots etc. — never inline base64. The agent CANNOT read
+        // images, so the prompt rules tell it to use a text tool instead
+        // of describing the file.
         const file = await saveLargeBlob(p.data, {
           deviceName: this.spec.name, toolName: upstreamName,
           mime: p.mimeType ?? "image/png",
         });
         chunks.push(
-          `[image saved to ${file} — mime=${p.mimeType ?? "image/png"}, ${p.data.length} base64 chars]`,
+          `[image saved to ${file} — you CANNOT read it. ` +
+          `If the user wanted information from a page, use a text-extraction ` +
+          `tool (browser_snapshot, browser_evaluate, get_page_content, etc.) ` +
+          `instead of describing this image. Tell the user the file path is saved.]`,
         );
       } else {
         const j = JSON.stringify(p);
-        if (j.length > MAX_INLINE_PART_CHARS) {
+        if (j.length > MAX_INLINE_BINARY_CHARS) {
           const file = await saveLargeBlob(j, {
             deviceName: this.spec.name, toolName: upstreamName, ext: "json",
           });
