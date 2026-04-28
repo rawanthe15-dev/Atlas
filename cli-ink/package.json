@@ -4,7 +4,7 @@
   "description": "Atlas CLI — Ink/React rewrite",
   "type": "module",
   "bin": {
-    "atlas-ink": "./dist/index.js"
+    "atlas-ink": "dist/index.js"
   },
   "scripts": {
     "dev": "tsx src/index.tsx",
@@ -25,9 +25,14 @@
     "undici": "^7.16.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.59.1",
     "@types/node": "^22.18.0",
     "@types/react": "^18.3.12",
     "tsx": "^4.20.0",
     "typescript": "^5.9.0"
-  }
+  },
+  "main": "index.js",
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
 }

@@ -64,9 +64,15 @@ Mapping cheatsheet for the \`query\` argument:
   random REST API without docs      → mount_device(kind="http", config={base_url})
 
 How \`auto_connect\` resolves:
-  status="mounted"            → done. The device's tools are now \`<name>__<tool>\`. Use them.
-  status="needs_confirmation" → list the candidates to the user; ask which to install.
-  status="no_match"           → fall back to mount_device with the right kind from the cheatsheet.
+  status="mounted"             → done. The device's tools are now \`<name>__<tool>\`. Use them.
+  status="needs_confirmation"  → list the candidates to the user; ask which to install.
+  status="no_match"            → fall back to mount_device with the right kind from the cheatsheet.
+  status="all_candidates_failed" → auto_connect already tried 3 trusted candidates; each
+                                  mounted but the runtime is missing on this machine
+                                  (returned in \`tried\` with the error). DO NOT retry the
+                                  same query — report to the user what was tried and why,
+                                  then ask whether to install the missing runtime manually
+                                  or use a different approach.
 
 Hard rules:
   • Never refuse a "connect to X" request without trying \`auto_connect\` first.

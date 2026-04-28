@@ -176,7 +176,27 @@ export class DevicesPlugin implements AtlasPlugin, DevicesAPI {
     cwd?: string,
   ): Promise<DeviceRecord> {
     const spec = await this.installer.installAndBuildSpec(candidate, deviceName, env, cwd);
-    return this.mountInternal(spec, { persist: true, source: candidate.source, skipPolicy: true });
+    const record = await this.mountInternal(spec, {
+      persist: true,
+      source: candidate.source,
+      skipPolicy: true,
+    });
+    // Smoke test catches MCPs that mount fine but their runtime is broken.
+    // This protects EVERY install path (auto_connect AND manual install_mcp),
+    // so the agent never sees an MCP whose first real call would fail with
+    // "Executable doesn't exist" or similar.
+    const smoke = await this.smokeTestMounted(record);
+    if (!smoke.ok) {
+      try {
+        await this.unmount(deviceName);
+      } catch {
+        /* ignore — best-effort rollback */
+      }
+      throw new Error(
+        `installed but the runtime is missing on this machine: ${smoke.error ?? "smoke test failed"}`,
+      );
+    }
+    return record;
   }
 
   async autoConnect(name: string, query: string): Promise<any> {
@@ -187,10 +207,33 @@ export class DevicesPlugin implements AtlasPlugin, DevicesAPI {
     const trusted = cands.filter(
       (c) => this.installPolicy.isTrusted(c.source, c.id) && c.installCommand.trim().length > 0,
     );
-    if (trusted.length > 0) {
-      const chosen = trusted[0]!;
+    if (trusted.length === 0) {
+      return {
+        status: "needs_confirmation",
+        message:
+          "found candidates but none are from a trusted source. call install_mcp(...) on one to confirm and proceed.",
+        candidates: cands.slice(0, 5).map(candidateToJSON),
+      };
+    }
+    // Walk trusted candidates; if one mounts but fails the smoke test
+    // (its first usable tool returns a runtime-missing error like
+    // "Executable doesn't exist"), automatically roll back and try the
+    // next one. This stops the agent from ever seeing a broken MCP.
+    const tried: Array<{ id: string; reason: string }> = [];
+    const MAX_ATTEMPTS = 3;
+    for (const cand of trusted.slice(0, MAX_ATTEMPTS)) {
+      let record: DeviceRecord | undefined;
       try {
-        const record = await this.installAndMountMcp(chosen, name);
+        record = await this.installAndMountMcp(cand, name);
+      } catch (e: any) {
+        if (e instanceof PolicyDenied) {
+          return { status: "denied", message: e.message, candidates: cands.map(candidateToJSON) };
+        }
+        tried.push({ id: cand.id, reason: `install/mount failed: ${e?.message ?? e}`.slice(0, 240) });
+        continue;
+      }
+      const smoke = await this.smokeTestMounted(record);
+      if (smoke.ok) {
         return {
           status: "mounted",
           device: {
@@ -199,24 +242,99 @@ export class DevicesPlugin implements AtlasPlugin, DevicesAPI {
             tools: record.toolNames,
             capabilities: record.spec.capabilities,
           },
-          chose: candidateToJSON(chosen),
-        };
-      } catch (e: any) {
-        if (e instanceof PolicyDenied) {
-          return { status: "denied", message: e.message, candidates: cands.map(candidateToJSON) };
-        }
-        return {
-          status: "install_failed",
-          message: `trusted candidate ${chosen.id} failed: ${e?.message ?? e}`,
-          candidates: cands.map(candidateToJSON),
+          chose: candidateToJSON(cand),
+          tried,
         };
       }
+      // Mount succeeded but the MCP can't actually run on this machine.
+      try {
+        await this.unmount(name);
+      } catch {
+        /* ignore — best-effort rollback */
+      }
+      tried.push({ id: cand.id, reason: smoke.error ?? "smoke test failed" });
     }
     return {
-      status: "needs_confirmation",
-      message: "found candidates but none are from a trusted source. call install_mcp(...) on one to confirm and proceed.",
+      status: "all_candidates_failed",
+      message:
+        `tried ${tried.length} trusted candidate${tried.length === 1 ? "" : "s"} for '${query}'; ` +
+        `each one mounted but the runtime is missing on this machine. ` +
+        `report this to the user — don't keep retrying. tell them what was tried and the error pattern.`,
+      tried,
       candidates: cands.slice(0, 5).map(candidateToJSON),
     };
+  }
+
+  /**
+   * Probe a freshly-mounted MCP to verify its runtime is actually usable.
+   *
+   * Strategy: pick a low-risk tool (read-only-looking name like list_*,
+   * get_*, status, ping; otherwise a tool with required params so the
+   * empty-args call fails validation harmlessly). Call it with empty args.
+   * Examine the result for runtime-missing patterns ("Executable doesn't
+   * exist", "ENOENT", "MODULE_NOT_FOUND", "please run ... install", etc.).
+   *
+   * Validation errors and other non-runtime errors mean the MCP is alive —
+   * smoke passes. Only the runtime-missing patterns are treated as fatal.
+   *
+   * If no tool is safe to probe, smoke is skipped (returns ok). Better to
+   * let a real call surface the issue than to side-effect on smoke.
+   */
+  private async smokeTestMounted(record: DeviceRecord): Promise<{ ok: boolean; error?: string }> {
+    if (record.spec.kind !== "mcp" || record.toolNames.length === 0) {
+      return { ok: true };
+    }
+    const probeName = this.pickSmokeTool(record);
+    if (!probeName) return { ok: true };
+    const tool = this.kernelTools.get(probeName);
+    if (!tool) return { ok: true };
+    try {
+      const TIMEOUT_MS = 30_000;
+      const result = await Promise.race([
+        tool.run({}),
+        new Promise<string>((resolve) => setTimeout(() => resolve("__smoke_timeout__"), TIMEOUT_MS)),
+      ]);
+      if (result === "__smoke_timeout__") return { ok: true };
+      if (looksLikeRuntimeMissing(result)) {
+        return { ok: false, error: result.slice(0, 240) };
+      }
+      return { ok: true };
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      if (looksLikeRuntimeMissing(msg)) {
+        return { ok: false, error: msg.slice(0, 240) };
+      }
+      return { ok: true };
+    }
+  }
+
+  private pickSmokeTool(record: DeviceRecord): string | undefined {
+    // Tier 1: action-style tools that EXERCISE the runtime. These are the
+    // ones most likely to surface missing-binary errors ("Executable doesn't
+    // exist") because their handlers call into the underlying engine before
+    // bothering to validate args. For non-browser MCPs, none of these
+    // prefixes match, so we fall through to safer probes.
+    const ACTION_PROBES =
+      /^(playwright_|browser_|browse_|page_|navigate|launch|open_page|open_browser|start_browser)/i;
+    for (const fullName of record.toolNames) {
+      const stripped = fullName.replace(`${record.spec.name}__`, "");
+      if (ACTION_PROBES.test(stripped)) return fullName;
+    }
+    // Tier 2: read-only-looking names — safe to call with empty args.
+    const READONLY_PREFIXES =
+      /^(list|get|info|status|describe|ping|health|version|tools|capabilities)/i;
+    for (const fullName of record.toolNames) {
+      const stripped = fullName.replace(`${record.spec.name}__`, "");
+      if (READONLY_PREFIXES.test(stripped)) return fullName;
+    }
+    // Tier 3: any tool whose schema requires args. Empty-args call fails
+    // validation harmlessly (and we'll inspect the error pattern).
+    for (const fullName of record.toolNames) {
+      const tool = this.kernelTools.get(fullName);
+      const required = (tool as any)?.parameters?.required;
+      if (Array.isArray(required) && required.length > 0) return fullName;
+    }
+    return undefined;
   }
 
   // ── internals ──────────────────────────────────────────────────────────
@@ -285,4 +403,20 @@ export class DevicesPlugin implements AtlasPlugin, DevicesAPI {
 
   // We need a stable reference to the kernel's ToolRegistry — captured in `load`.
   private kernelTools!: Kernel["tools"];
+}
+
+const RUNTIME_MISSING_PATTERNS = [
+  /Executable doesn'?t exist/i,
+  /Browser was not found/i,
+  /Looks like Playwright Test or Playwright was just installed/i,
+  /please run.*install/i,
+  /\bENOENT\b/,
+  /\bMODULE_NOT_FOUND\b/,
+  /Cannot find module/i,
+  /command not found/i,
+  /spawn .* ENOENT/,
+];
+
+function looksLikeRuntimeMissing(s: string): boolean {
+  return RUNTIME_MISSING_PATTERNS.some((p) => p.test(s));
 }
