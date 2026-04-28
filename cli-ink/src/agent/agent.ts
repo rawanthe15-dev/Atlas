@@ -33,6 +33,31 @@ export interface AgentOpts {
 const MAX_HISTORY_MESSAGES = 40;
 const MAX_TOOL_ROUNDS = 25;
 
+// Default summarizer model — 1M context, free tier, very fast. Used when
+// the active model returns a context-overflow 400, or when the user runs
+// /compact manually. Override via config.openrouter.compact_model.
+const DEFAULT_COMPACT_MODEL = "google/gemini-2.0-flash-exp:free";
+
+function approxTokens(messages: ChatMessage[]): number {
+  let total = 0;
+  for (const m of messages) {
+    total += String(m.content ?? "").length;
+    if (m.tool_calls) total += JSON.stringify(m.tool_calls).length;
+  }
+  return Math.ceil(total / 4); // ~4 chars per token; rough but fine for UI
+}
+
+function isContextLimitError(e: unknown): boolean {
+  const msg = String((e as any)?.message ?? e);
+  if (!/\b400\b/.test(msg)) return false;
+  return (
+    /maximum context length/i.test(msg) ||
+    /context.{0,20}length/i.test(msg) ||
+    /context.{0,20}window/i.test(msg) ||
+    /token.{0,10}limit/i.test(msg)
+  );
+}
+
 const OPERATING_INSTRUCTIONS = `--- Operating instructions ---
 For multi-step tasks: plan ALL steps upfront with todo_add (one call per step), then execute them through tool calls. Independent tool calls in the SAME response run in PARALLEL — batch them aggressively (e.g. issue 8 discord_create_channel calls together, not 8 turns). Mark todos in_progress when you start them and todo_complete when done. Don't ask the user for confirmation between steps unless something genuinely needs their input — just do the work.
 
@@ -156,6 +181,73 @@ export class Agent {
     this.history = [];
   }
 
+  /**
+   * Compress the current history into a short summary using a long-context
+   * free model, then replace history with that summary. Used by /compact
+   * and triggered automatically on context-overflow 400s.
+   */
+  async compact(opts: { model?: string } = {}): Promise<{ before: number; after: number; modelUsed: string }> {
+    const before = approxTokens(this.history);
+    if (this.history.length === 0) {
+      return { before: 0, after: 0, modelUsed: "" };
+    }
+    const model = opts.model ?? DEFAULT_COMPACT_MODEL;
+    const transcript = this.history
+      .map((m) => {
+        if (m.role === "tool") return `[tool result] ${String(m.content ?? "").slice(0, 600)}`;
+        if (m.tool_calls?.length)
+          return `${m.role}: [called ${m.tool_calls.map((t) => t.function.name).join(", ")}] ${m.content ?? ""}`;
+        return `${m.role}: ${m.content ?? ""}`;
+      })
+      .join("\n");
+    const prompt =
+      "Summarize the following conversation in 200-500 words. Preserve: " +
+      "(1) the user's overall goal, " +
+      "(2) which devices/MCPs are mounted and what their tools do, " +
+      "(3) key facts established, " +
+      "(4) what was just attempted and the result, " +
+      "(5) what remains to do.\n" +
+      "Skip pleasantries, internal reasoning chatter, and verbatim tool dumps. " +
+      "Return ONLY the summary text, no preamble or markdown headers.\n\n" +
+      transcript;
+
+    let summary = "";
+    try {
+      for await (const ev of streamChat({
+        apiKey: this.opts.apiKey,
+        baseUrl: this.opts.baseUrl,
+        model,
+        messages: [{ role: "user", content: prompt }],
+      })) {
+        if (ev.type === "token") summary += ev.content;
+      }
+    } catch (e: any) {
+      // If the summarizer also fails (e.g. it's down), fall back to a
+      // mechanical truncation: keep the last ~10 turns verbatim, drop
+      // everything earlier. Better than nothing.
+      const KEEP = 10;
+      const dropped = Math.max(0, this.history.length - KEEP);
+      this.history = this.history.slice(-KEEP);
+      const after = approxTokens(this.history);
+      return {
+        before,
+        after,
+        modelUsed: `(summarizer ${model} failed: ${String(e?.message ?? e).slice(0, 120)} — kept last ${KEEP} turns, dropped ${dropped})`,
+      };
+    }
+    summary = summary.trim() || "(empty summary returned)";
+    this.history = [
+      {
+        role: "user",
+        content:
+          "[Earlier conversation compacted to save context. Summary follows; treat as established background, then continue.]",
+      },
+      { role: "assistant", content: summary },
+    ];
+    const after = approxTokens(this.history);
+    return { before, after, modelUsed: model };
+  }
+
   /** Seed history with prior session entries (for /sessions resume). */
   seedHistory(entries: SessionEntry[], maxPairs = 10): void {
     const recent = entries.slice(-maxPairs);
@@ -251,27 +343,50 @@ export class Agent {
 
     const toolSchemas = this.opts.tools.schemas();
     let finalText = "";
+    let compactedThisTurn = false;
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       const tokens: string[] = [];
       const toolCalls: { id: string; name: string; arguments: string }[] = [];
 
-      for await (const ev of streamChat({
-        apiKey: this.opts.apiKey,
-        baseUrl: this.opts.baseUrl,
-        model: this.opts.model,
-        messages,
-        tools: toolSchemas,
-        signal,
-      })) {
-        if (ev.type === "token") {
-          tokens.push(ev.content);
-          cb.onToken?.(ev.content);
-        } else if (ev.type === "reasoning") {
-          cb.onReasoning?.(ev.content);
-        } else if (ev.type === "tool_call") {
-          toolCalls.push({ id: ev.id, name: ev.name, arguments: ev.arguments });
+      try {
+        for await (const ev of streamChat({
+          apiKey: this.opts.apiKey,
+          baseUrl: this.opts.baseUrl,
+          model: this.opts.model,
+          messages,
+          tools: toolSchemas,
+          signal,
+        })) {
+          if (ev.type === "token") {
+            tokens.push(ev.content);
+            cb.onToken?.(ev.content);
+          } else if (ev.type === "reasoning") {
+            cb.onReasoning?.(ev.content);
+          } else if (ev.type === "tool_call") {
+            toolCalls.push({ id: ev.id, name: ev.name, arguments: ev.arguments });
+          }
         }
+      } catch (e: any) {
+        // Auto-compact on context overflow: summarise prior history with a
+        // long-context free model, then retry this round once. If it
+        // overflows AGAIN after compaction, give up and rethrow.
+        if (!compactedThisTurn && isContextLimitError(e)) {
+          compactedThisTurn = true;
+          cb.onToken?.("\n[atlas: context full — compacting earlier conversation and retrying...]\n");
+          const result = await this.compact();
+          cb.onToken?.(
+            `[atlas: compacted ${result.before} → ${result.after} tokens via ${result.modelUsed}]\n`,
+          );
+          // Rebuild messages with the new compacted history.
+          messages.length = 0;
+          messages.push({ role: "system", content: systemPrompt });
+          for (const m of this.history) messages.push(m);
+          messages.push({ role: "user", content: userInput });
+          round--; // retry this round
+          continue;
+        }
+        throw e;
       }
 
       finalText = tokens.join("");

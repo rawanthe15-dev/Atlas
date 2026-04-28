@@ -35,7 +35,19 @@ export class BridgeTool implements Tool {
 
   async run(args: Record<string, any>): Promise<string> {
     try {
-      return await this.bridge.invoke(this.spec, args);
+      const out = await this.bridge.invoke(this.spec, args);
+      // Final safety net — if a bridge that doesn't already chunk its
+      // output (e.g., http) returns a giant blob, truncate before it
+      // hits the model's context. MCPBridge handles this internally with
+      // file offloading; this is for everything else.
+      const HARD_CAP = 32_000;
+      if (out.length > HARD_CAP) {
+        return (
+          out.slice(0, HARD_CAP - 200) +
+          `\n... (truncated — ${out.length - HARD_CAP} more chars dropped to protect context)`
+        );
+      }
+      return out;
     } catch (e: any) {
       return `Bridge '${this.bridge.name}' error: ${e?.message ?? e}`;
     }

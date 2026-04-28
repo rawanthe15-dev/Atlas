@@ -1,7 +1,39 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { request } from "undici";
 import { Bridge } from "./base.js";
 import { BridgeError, type ToolSpec } from "./types.js";
+
+// Cap the per-content-part text we keep in tool output. Anything larger
+// (typically a base64-encoded image or a giant JSON dump) is offloaded
+// to /tmp and replaced with a short "[saved to /tmp/...]" reference. This
+// stops a single screenshot from dumping ~700kB of tokens into the
+// conversation history.
+const MAX_INLINE_PART_CHARS = 8_000;
+const ATLAS_TMP_DIR = path.join(tmpdir(), "atlas-bridge-output");
+
+async function saveLargeBlob(
+  data: string,
+  hint: { mime?: string; ext?: string; deviceName: string; toolName: string },
+): Promise<string> {
+  await mkdir(ATLAS_TMP_DIR, { recursive: true });
+  const ext =
+    hint.ext ||
+    (hint.mime?.startsWith("image/") ? hint.mime.split("/")[1] || "bin" : "txt");
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const safeDevice = hint.deviceName.replace(/[^A-Za-z0-9_-]/g, "_");
+  const safeTool = hint.toolName.replace(/[^A-Za-z0-9_-]/g, "_");
+  const file = path.join(ATLAS_TMP_DIR, `${safeDevice}_${safeTool}_${stamp}.${ext}`);
+  // base64 → binary; otherwise write as text
+  if (hint.mime && /^image\//.test(hint.mime) && /^[A-Za-z0-9+/=\s]+$/.test(data)) {
+    await writeFile(file, Buffer.from(data, "base64"));
+  } else {
+    await writeFile(file, data, "utf8");
+  }
+  return file;
+}
 
 const PROTOCOL_VERSION = "2024-11-05";
 
@@ -248,8 +280,40 @@ export class MCPBridge extends Bridge {
     const parts = (result?.content ?? []) as any[];
     const chunks: string[] = [];
     for (const p of parts) {
-      if (p?.type === "text" && typeof p.text === "string") chunks.push(p.text);
-      else chunks.push(JSON.stringify(p));
+      if (p?.type === "text" && typeof p.text === "string") {
+        // Even text parts can be huge (a 200kB log dump). Offload anything
+        // over the cap so it doesn't blow the agent's context window.
+        if (p.text.length > MAX_INLINE_PART_CHARS) {
+          const file = await saveLargeBlob(p.text, {
+            deviceName: this.spec.name, toolName: upstreamName, ext: "txt",
+          });
+          chunks.push(
+            `[large text content (${p.text.length} chars) saved to ${file}]\n` +
+            `${p.text.slice(0, 2000)}\n... (truncated; full content in file)`,
+          );
+        } else {
+          chunks.push(p.text);
+        }
+      } else if (p?.type === "image" && typeof p.data === "string") {
+        // Screenshots etc. — never inline base64 in tool output.
+        const file = await saveLargeBlob(p.data, {
+          deviceName: this.spec.name, toolName: upstreamName,
+          mime: p.mimeType ?? "image/png",
+        });
+        chunks.push(
+          `[image saved to ${file} — mime=${p.mimeType ?? "image/png"}, ${p.data.length} base64 chars]`,
+        );
+      } else {
+        const j = JSON.stringify(p);
+        if (j.length > MAX_INLINE_PART_CHARS) {
+          const file = await saveLargeBlob(j, {
+            deviceName: this.spec.name, toolName: upstreamName, ext: "json",
+          });
+          chunks.push(`[large ${p?.type ?? "non-text"} part (${j.length} chars) saved to ${file}]`);
+        } else {
+          chunks.push(j);
+        }
+      }
     }
     if (result?.isError) return "[mcp tool returned error]\n" + chunks.join("\n");
     return chunks.length ? chunks.join("\n") : "(empty)";

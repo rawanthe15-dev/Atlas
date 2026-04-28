@@ -18,6 +18,7 @@ import {
 import { DeviceStore } from "../bridges/state.js";
 import type { BridgeSpec, DeviceRecord } from "../bridges/types.js";
 import { specFromJSON } from "../bridges/types.js";
+import { VerifiedStore, type VerifiedMCP } from "../bridges/verified.js";
 
 import {
   makeAutoConnectTool,
@@ -54,9 +55,11 @@ export class DevicesPlugin implements AtlasPlugin, DevicesAPI {
   private records = new Map<string, DeviceRecord>();
   private bridges = new Map<string, Bridge>();
   private store!: DeviceStore;
+  private verified!: VerifiedStore;
   private installPolicy = new InstallPolicy();
   private installer = new MCPInstaller(this.installPolicy);
   private mountConfirm?: InstallConfirmFn;
+  private lastInstallQuery: string | null = null;
 
   constructor(private opts: DevicesPluginOpts = {}) {
     if (opts.installConfirm) {
@@ -73,6 +76,7 @@ export class DevicesPlugin implements AtlasPlugin, DevicesAPI {
 
     const memPath = (kernel.config.memory?.path as string) ?? path.join(ATLAS_ROOT, "memory");
     this.store = new DeviceStore(path.join(memPath, "devices"));
+    this.verified = new VerifiedStore(path.join(memPath, "devices"));
 
     // Expose the management tools on the agent's tool registry.
     const tools: Tool[] = [
@@ -182,32 +186,77 @@ export class DevicesPlugin implements AtlasPlugin, DevicesAPI {
       skipPolicy: true,
     });
     // Smoke test catches MCPs that mount fine but their runtime is broken.
-    // This protects EVERY install path (auto_connect AND manual install_mcp),
-    // so the agent never sees an MCP whose first real call would fail with
-    // "Executable doesn't exist" or similar.
+    // This protects EVERY install path (auto_connect AND manual install_mcp).
     const smoke = await this.smokeTestMounted(record);
     if (!smoke.ok) {
       try {
         await this.unmount(deviceName);
       } catch {
-        /* ignore — best-effort rollback */
+        /* ignore */
+      }
+      // If this candidate was previously verified for some other query,
+      // its runtime is now missing — forget it so we don't reuse it.
+      try {
+        await this.verified.forget(candidate.id);
+      } catch {
+        /* ignore */
       }
       throw new Error(
         `installed but the runtime is missing on this machine: ${smoke.error ?? "smoke test failed"}`,
       );
     }
+    // Smoke passed — remember this candidate as known-good for the query
+    // that brought us here. `lastInstallQuery` is set by autoConnect; for
+    // direct install_mcp calls there's no query, so we use the candidate's
+    // own name as a weak keyword.
+    try {
+      const queryHint = this.lastInstallQuery ?? `${candidate.name} ${candidate.description}`;
+      await this.verified.record(candidate, queryHint);
+    } catch {
+      /* best-effort */
+    }
     return record;
   }
 
   async autoConnect(name: string, query: string): Promise<any> {
+    this.lastInstallQuery = query;
+    // 0. Verified cache — try anything we've previously confirmed works
+    //    on THIS machine for a similar query, before hitting public registries.
+    const verifiedHits = await this.verified.match(query);
+    const tried: Array<{ id: string; reason: string }> = [];
+    const MAX_ATTEMPTS = 3;
+    for (const v of verifiedHits.slice(0, MAX_ATTEMPTS)) {
+      const fakeCandidate: MCPCandidate = {
+        id: v.id, source: v.source, name: v.name, description: v.description,
+        installCommand: v.installCommand, transport: "stdio", homepage: "", score: 100,
+      };
+      try {
+        const record = await this.installAndMountMcp(fakeCandidate, name);
+        return {
+          status: "mounted",
+          source_used: "verified_cache",
+          device: {
+            name: record.spec.name,
+            kind: record.spec.kind,
+            tools: record.toolNames,
+            capabilities: record.spec.capabilities,
+          },
+          chose: candidateToJSON(fakeCandidate),
+        };
+      } catch (e: any) {
+        tried.push({ id: v.id, reason: `verified-cache entry failed: ${String(e?.message ?? e).slice(0, 200)}` });
+        // verified entry got forgotten in installAndMountMcp on smoke-fail
+      }
+    }
+
     const cands = await this.searchMcp(query, 10);
-    if (cands.length === 0) {
+    if (cands.length === 0 && tried.length === 0) {
       return { status: "no_match", message: `no MCP servers matched '${query}'`, candidates: [] };
     }
     const trusted = cands.filter(
       (c) => this.installPolicy.isTrusted(c.source, c.id) && c.installCommand.trim().length > 0,
     );
-    if (trusted.length === 0) {
+    if (trusted.length === 0 && tried.length === 0) {
       return {
         status: "needs_confirmation",
         message:
@@ -215,27 +264,14 @@ export class DevicesPlugin implements AtlasPlugin, DevicesAPI {
         candidates: cands.slice(0, 5).map(candidateToJSON),
       };
     }
-    // Walk trusted candidates; if one mounts but fails the smoke test
-    // (its first usable tool returns a runtime-missing error like
-    // "Executable doesn't exist"), automatically roll back and try the
-    // next one. This stops the agent from ever seeing a broken MCP.
-    const tried: Array<{ id: string; reason: string }> = [];
-    const MAX_ATTEMPTS = 3;
-    for (const cand of trusted.slice(0, MAX_ATTEMPTS)) {
-      let record: DeviceRecord | undefined;
+    // Walk trusted candidates. installAndMountMcp runs smoke test
+    // internally and throws on failure, so a successful return = working MCP.
+    for (const cand of trusted.slice(0, MAX_ATTEMPTS - tried.length)) {
       try {
-        record = await this.installAndMountMcp(cand, name);
-      } catch (e: any) {
-        if (e instanceof PolicyDenied) {
-          return { status: "denied", message: e.message, candidates: cands.map(candidateToJSON) };
-        }
-        tried.push({ id: cand.id, reason: `install/mount failed: ${e?.message ?? e}`.slice(0, 240) });
-        continue;
-      }
-      const smoke = await this.smokeTestMounted(record);
-      if (smoke.ok) {
+        const record = await this.installAndMountMcp(cand, name);
         return {
           status: "mounted",
+          source_used: "registry_search",
           device: {
             name: record.spec.name,
             kind: record.spec.kind,
@@ -245,14 +281,13 @@ export class DevicesPlugin implements AtlasPlugin, DevicesAPI {
           chose: candidateToJSON(cand),
           tried,
         };
+      } catch (e: any) {
+        if (e instanceof PolicyDenied) {
+          return { status: "denied", message: e.message, candidates: cands.map(candidateToJSON) };
+        }
+        tried.push({ id: cand.id, reason: String(e?.message ?? e).slice(0, 240) });
+        continue;
       }
-      // Mount succeeded but the MCP can't actually run on this machine.
-      try {
-        await this.unmount(name);
-      } catch {
-        /* ignore — best-effort rollback */
-      }
-      tried.push({ id: cand.id, reason: smoke.error ?? "smoke test failed" });
     }
     return {
       status: "all_candidates_failed",

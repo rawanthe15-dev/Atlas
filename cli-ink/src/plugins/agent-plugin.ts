@@ -18,5 +18,28 @@ export class AgentPlugin implements AtlasPlugin {
       maxContextEntries: c.memory?.max_context_entries ?? 5,
       maxSessionHistory: c.memory?.max_session_history ?? 3,
     });
+
+    kernel.registerCommand({
+      name: "/compact",
+      description: "Compact conversation history (summarise prior turns to free up context)",
+      handler: async () => {
+        try {
+          const result = await kernel.agent.compact();
+          if (result.before === 0) {
+            return { kind: "text", text: "(history is empty — nothing to compact)", dim: true };
+          }
+          return {
+            kind: "text",
+            text:
+              `compacted ${result.before} → ${result.after} tokens ` +
+              `(${Math.round(((result.before - result.after) / result.before) * 100)}% reduction) ` +
+              `via ${result.modelUsed}`,
+            dim: true,
+          };
+        } catch (e: any) {
+          return { kind: "error", text: `compact failed: ${e?.message ?? e}` };
+        }
+      },
+    });
   }
 }
