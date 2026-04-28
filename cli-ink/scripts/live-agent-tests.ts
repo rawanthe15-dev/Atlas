@@ -31,6 +31,7 @@ import { AgentPlugin } from "../src/plugins/agent-plugin.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ATLAS_ROOT = resolve(__dirname, "..", "..");
 const FAKE_MCP_PATH = resolve(ATLAS_ROOT, "tests", "_fixtures", "fake_mcp_server.py");
+const FAKE_FAILING_MCP_PATH = resolve(ATLAS_ROOT, "tests", "_fixtures", "fake_failing_mcp.py");
 
 // ─── colour helpers ──────────────────────────────────────────────────────
 
@@ -298,6 +299,41 @@ const scenarios: Scenario[] = [
       } finally {
         await cam.close();
       }
+    },
+  },
+  {
+    title: "Level 7 — Failing MCP recovery (no shell-loop)",
+    async run(kernel) {
+      // Pre-mount a fake MCP whose tool calls ALWAYS return the exact error
+      // shape that previously sent the agent into a 10-shell-call loop.
+      // The agent doesn't know it's broken — it has to discover that from
+      // the tool result and recover via the rules in DEVICE_AUTONOMY_NUDGE.
+      const devices = (kernel as any).plugins?.find?.((p: any) => p.name === "devices") ?? null;
+      // We already have devices via closure earlier; pull it from kernel state.
+      // (The harness's bootAtlas returns devices, but main() passes only kernel
+      // here. Simpler: use mount_device tool through the agent directly.)
+      const setupPrompt =
+        `Mount this MCP server as 'browser': it's a Python script at ` +
+        `${FAKE_FAILING_MCP_PATH} that speaks MCP stdio. After mounting, ` +
+        `call its navigate tool with url="https://example.com". If that ` +
+        `tool call returns an error, follow your failure-recovery rules.`;
+      console.log(`${C.bold}→${C.reset} ${setupPrompt}`);
+      const run = new Run();
+      await kernel.agent!.process(setupPrompt, run.callbacks());
+      console.log();
+
+      const shellCalls = run.toolCalls.filter((t) => t === "shell").length;
+      const totalCalls = run.toolCalls.length;
+      const sawErrorBefore = run.toolResults.some(([_, r]) =>
+        r.includes("Executable doesn't exist") || r.includes("Please run"),
+      );
+      // Pass if: the agent saw the error AND didn't loop on shell.
+      // Hard ceiling per the prompt rule: ≤3 shell calls for setup.
+      const passed = sawErrorBefore && shellCalls <= 3 && totalCalls < 15;
+      passed
+        ? okmark(`agent recovered without looping (${totalCalls} total calls, ${shellCalls} shell calls)`)
+        : fail(`shell=${shellCalls} total=${totalCalls} sawError=${sawErrorBefore} tools=${run.toolCalls.join(", ")}`);
+      return passed;
     },
   },
   {

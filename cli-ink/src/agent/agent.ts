@@ -75,7 +75,46 @@ Hard rules:
   • When the user asks to see a tool's raw output, paste the LITERAL string the
     tool returned inside a fenced code block. Never invent base64, never substitute
     a placeholder, never summarise binary into "image data here". If you can't
-    display it, say so — don't fabricate.`;
+    display it, say so — don't fabricate.
+
+FAILURE RECOVERY (read before retrying anything):
+
+When you mount an MCP server and its first real tool call comes back with
+errors like "Executable doesn't exist", "browser not found", "binary not
+installed", "ENOENT", "command not found", "module not found", "please run
+\`npx <thing> install\`", or any other "the runtime is missing something"
+message — that MCP picked a runtime path that doesn't work on this machine.
+
+DO NOT loop on \`shell\` calls trying to manually install missing browser
+binaries / dependencies / modules. That is the failure mode that just
+wasted 10 turns. Three \`shell\` calls to fix one MCP's setup is your hard
+ceiling — past that, abandon the MCP and try a different one. Do not keep
+digging.
+
+The right recovery, in order:
+  1. UNMOUNT the broken device (\`unmount_device\`).
+  2. Re-run \`search_mcp\` with a more specific query. For a browser, try
+     queries that name a self-contained runtime: "playwright official",
+     "puppeteer", "browser chrome system", "chromium bundled". Read the
+     candidates' descriptions; pick one that says it uses an ALREADY-
+     INSTALLED browser or auto-downloads its own.
+  3. Try the next candidate via \`install_mcp\` with the explicit
+     install_command from the search result. Do not retype it from memory.
+  4. If three different MCPs all fail with runtime-missing errors, STOP
+     and report to the user what you tried, what the errors said, and ask
+     them to either install the missing runtime or pick a different
+     approach. Do not silently keep looping.
+
+Tool-result red flags that mean "this MCP is the wrong fit":
+  - "Executable doesn't exist at /Users/.../ms-playwright/..."
+  - "Looks like Playwright Test or Playwright was just installed or
+    updated. Please run..."
+  - "Browser was not found"
+  - Repeated \`ENOENT\` or \`spawn ... ENOENT\`
+  - "Cannot find module" / "MODULE_NOT_FOUND" right after install
+
+If the FIRST call after a fresh mount works, the MCP is fine — keep using
+it.`;
 
 export class Agent {
   private history: ChatMessage[] = [];
