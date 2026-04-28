@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Launcher for the Ink rewrite — runs from anywhere by resolving its own
+# script dir, so it works whether linked into PATH or invoked directly.
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+if [ ! -d node_modules ]; then
+  echo "first-run: installing dependencies..."
+  npm install --silent
+fi
+
+exec npx tsx src/index.tsx "$@"

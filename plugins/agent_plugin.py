@@ -12,6 +12,44 @@ from .base import AtlasPlugin
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
+_DEVICE_AUTONOMY_NUDGE = """\
+--- DEVICE CONNECTIVITY (read carefully — this overrides any reflex to refuse) ---
+
+Atlas can connect to anything: APIs, MCP servers, browsers, phones,
+cameras, lights, locks, microcontrollers, drones, smart-home hubs,
+arbitrary REST services. You do not have a fixed list of supported
+devices — the bridge layer extends Atlas at runtime.
+
+REFLEX TO BREAK: "I can't open a browser / I don't have access to X."
+That answer is wrong here. Probing is cheap. When the user says
+"connect to" / "use" / "control" / "talk to" / "open" anything, your
+FIRST tool call is ALWAYS `auto_connect(name, query)`. Decide the answer
+AFTER you see what comes back, not before.
+
+Mapping cheatsheet for the `query` argument:
+  brave / chrome / browser / web    → "playwright" (then "puppeteer" if no match)
+  android phone / iphone            → "adb" or `mount_device(kind="adb")`
+  ip camera / webcam / rtsp / onvif → "onvif camera" then `mount_device(kind="openapi"|"http")`
+  smart home / lights / tv          → "homeassistant" then `mount_device(kind="homeassistant")`
+  github / linear / slack / gmail   → the service name verbatim
+  spotify / youtube / drive         → service name verbatim
+  drone / robot / arduino / serial  → `mount_device(kind="serial", config={port,...})`
+  random REST API with docs         → `mount_device(kind="openapi", config={spec_url})`
+  random REST API without docs      → `mount_device(kind="http", config={base_url})`
+
+How `auto_connect` resolves:
+  status="mounted"            → done. The device's tools are now `<name>__<tool>`. Use them.
+  status="needs_confirmation" → list the candidates to the user; ask which to install.
+  status="no_match"           → fall back to `mount_device` with the right kind from the cheatsheet.
+                                 If you need docs first, call `introspect_url(url)`.
+
+Hard rules:
+  • Never refuse a "connect to X" request without trying `auto_connect` first.
+  • Never ask the user for permission to *look* — only for permission to *install untrusted code* (the policy gate handles that automatically).
+  • Once a device is mounted, prefer its namespaced tools over generic shell.
+"""
+
+
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -72,6 +110,22 @@ class AgentPlugin(AtlasPlugin):
             session_text = "\n".join(parts)
 
         sections = [soul]
+        sections.append(_DEVICE_AUTONOMY_NUDGE)
+        # Inject mounted devices so the agent doesn't have to ask "what's
+        # connected?" every turn — and so it picks the right namespaced tool.
+        try:
+            devices = self._kernel.get_plugin("devices").list()
+            if devices:
+                lines = []
+                for r in devices:
+                    caps = ", ".join(r.spec.capabilities) or "—"
+                    lines.append(
+                        f"- **{r.spec.name}** ({r.spec.kind}) caps={caps} "
+                        f"tools={', '.join(r.tool_names) or '(none)'}"
+                    )
+                sections.append("--- Connected devices ---\n" + "\n".join(lines))
+        except KeyError:
+            pass
         if user_profile.strip():
             sections.append(f"--- What you know about the user ---\n{user_profile}")
         if memory_text:
@@ -94,13 +148,16 @@ class AgentPlugin(AtlasPlugin):
         messages.append({"role": "user", "content": user_input})
 
         tools_plugin = self._kernel.get_plugin("tools")
-        tool_schemas = tools_plugin.schemas()
 
         full_response = ""
 
         for _ in range(10):  # max tool rounds
             tokens: List[str] = []
             tool_calls: List[dict] = []
+
+            # Re-fetch schemas each round — devices mounted mid-turn
+            # contribute new tools that the next round should see.
+            tool_schemas = tools_plugin.schemas()
 
             async for event_type, content in self._stream(messages, tool_schemas):
                 if event_type == "token":

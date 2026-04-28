@@ -1,66 +1,25 @@
+from __future__ import annotations
+
 import asyncio
 import os
-import shutil
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TextIO, cast
 
 from rich.console import Console
-from rich.live import Live
-from rich.markdown import Markdown
-from rich.rule import Rule
-from rich.text import Text
 
-from functools import partial
-
-from prompt_toolkit.application import Application
+from prompt_toolkit import Application, PromptSession
 from prompt_toolkit.application.run_in_terminal import in_terminal
-from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import Completer, Completion
-from prompt_toolkit.filters import Condition
-from prompt_toolkit.formatted_text import ANSI, HTML
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import Layout
-from prompt_toolkit.layout.containers import (
-    ConditionalContainer,
-    Float,
-    FloatContainer,
-    HSplit,
-    VSplit,
-    Window,
-)
-from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.layout import FloatContainer, Float, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
-from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.patch_stdout import StdoutProxy
 from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import TextArea
-
-
-def rounded_frame(body):
-    """Frame with rounded corners (╭╮╰╯) — Claude Code style."""
-    fill = partial(Window, style="class:frame.border")
-    return HSplit(
-        [
-            VSplit([
-                fill(width=1, height=1, char="╭"),
-                fill(char="─", height=1),
-                fill(width=1, height=1, char="╮"),
-            ]),
-            VSplit([
-                fill(width=1, char="│"),
-                body,
-                fill(width=1, char="│"),
-            ]),
-            VSplit([
-                fill(width=1, height=1, char="╰"),
-                fill(char="─", height=1),
-                fill(width=1, height=1, char="╯"),
-            ]),
-        ],
-        style="class:frame",
-    )
+from prompt_toolkit.widgets import Frame, TextArea
 
 try:
     import tomllib  # py311+
@@ -72,12 +31,20 @@ import tomli_w
 from .base import AtlasPlugin
 
 
-# Locate the project root so commands work from any cwd
 ATLAS_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ATLAS_ROOT / "config.toml"
 
+# patch_stdout's default sleep_between_writes is 200ms — that bundles tokens into
+# visible chunks. 20ms keeps token streaming smooth without thrashing the renderer.
+STREAMING_FLUSH_INTERVAL = 0.02
 
-# Block-letter ATLAS logo
+# How often to force-drain the StdoutProxy buffer while a response is in flight.
+# Newline-terminated content flushes naturally; this exists for models that
+# emit long stretches without newlines, so the user sees progress instead of
+# nothing until the next \n arrives.
+PARTIAL_FLUSH_INTERVAL = 0.15
+
+
 ATLAS_ART = [
     "  █████╗ ████████╗██╗      █████╗ ███████╗",
     " ██╔══██╗╚══██╔══╝██║     ██╔══██╗██╔════╝",
@@ -102,6 +69,7 @@ COMMANDS = {
     "/memory":       "Show what Atlas knows about you",
     "/soul":         "Show Atlas's identity",
     "/tools":        "List available tools",
+    "/devices":      "Manage connected devices and MCP servers",
     "/sessions":     "List recent conversation sessions",
     "/model":        "Switch model — usage: /model <name>",
     "/version":      "Show Atlas version and commit",
@@ -111,18 +79,14 @@ COMMANDS = {
 }
 
 
-# Theme — Atlas cyan/dark aesthetic, matched across frame, toolbar, and completions
 INPUT_STYLE = Style.from_dict({
-    # Input frame
-    "frame.border":        "#3a4a5a",
-    "input":               "",
+    "frame.border":  "ansicyan",
+    "frame.label":   "ansicyan bold",
 
-    # Toolbar (status bar below the frame)
     "toolbar":             "#5a6a7a italic",
     "toolbar.accent":      "ansicyan bold",
     "toolbar.warn":        "ansiyellow",
 
-    # Completion dropdown — match the dark theme
     "completion-menu":                          "bg:#0d1620",
     "completion-menu.completion":               "bg:#0d1620 #c0d0e0",
     "completion-menu.completion.current":       "bg:ansicyan #000000 bold",
@@ -130,7 +94,6 @@ INPUT_STYLE = Style.from_dict({
     "completion-menu.meta.completion.current":  "bg:ansicyan #1a3040 italic",
     "completion-menu.multi-column-meta":        "bg:#0d1620 #5a7a9a",
 
-    # Scrollbar inside the dropdown
     "scrollbar.background":  "bg:#0d1620",
     "scrollbar.button":      "bg:#3a4a5a",
 })
@@ -163,7 +126,6 @@ class SlashCompleter(Completer):
         if not text.startswith("/"):
             return
 
-        # /model <arg> → suggest favorite models
         if text.startswith("/model "):
             arg = text[len("/model "):]
             current = self._current_model()
@@ -180,7 +142,6 @@ class SlashCompleter(Completer):
                     )
             return
 
-        # Top-level slash commands
         for full_cmd, desc in COMMANDS.items():
             cmd = full_cmd.split()[0]
             if cmd.startswith(text):
@@ -197,14 +158,6 @@ class CLIPlugin(AtlasPlugin):
 
     def __init__(self):
         self._console = Console(highlight=False)
-        # Separate console for capturing markdown→ANSI strings to feed into
-        # prompt_toolkit's layout. force_terminal=True so rich emits color
-        # codes even though the capture target isn't a TTY.
-        self._render_console = Console(
-            force_terminal=True,
-            color_system="truecolor",
-            highlight=False,
-        )
         self._kernel = None
         self._running = False
         self._history = InMemoryHistory()
@@ -212,19 +165,17 @@ class CLIPlugin(AtlasPlugin):
             favorites_getter=self._get_favorite_models,
             current_model_getter=self._get_current_model,
         )
-        self._input_queue: Optional[asyncio.Queue] = None
+
         self._app: Optional[Application] = None
         self._text_area: Optional[TextArea] = None
+        self._input_queue: Optional[asyncio.Queue] = None
         self._processor_task: Optional[asyncio.Task] = None
-        self._current_process_task: Optional[asyncio.Task] = None  # the in-flight LLM call
-        self._is_processing = False  # toolbar shows "thinking..." when True
-        self._showed_thinking_header = False  # reset per turn — prefix once before reasoning stream
-        self._showed_response_header = False  # reset per turn — newline boundary between reasoning and answer
-        self._response_buffer = ""             # accumulates tokens; live-rendered as markdown
-        # Streaming buffer drives a Window in the app layout — prompt_toolkit
-        # redraws it natively so live markdown rendering works without
-        # fighting patch_stdout.
-        self._streaming_buffer = ""
+        self._current_process_task: Optional[asyncio.Task] = None
+        self._is_processing = False
+
+        self._showed_thinking_header = False
+        self._showed_response_header = False
+        self._response_buffer = ""
 
     # ── favorites accessors ───────────────────────────────────────────────
 
@@ -246,23 +197,26 @@ class CLIPlugin(AtlasPlugin):
         self._running = True
         self._input_queue = asyncio.Queue()
 
-        # Wire the shell-confirm callback if config asks for it
         shell_confirm = kernel.config.get("tools", {}).get("shell_confirm", True)
         if shell_confirm:
             shell_tool = kernel.get_plugin("tools").get("shell")
             if shell_tool and hasattr(shell_tool, "set_confirm"):
                 shell_tool.set_confirm(self._confirm_shell)
 
-        # Print the static startup banner first (via normal stdout, no live area yet)
+        # Wire user-confirmation for installing MCP servers.
+        try:
+            devices_plugin = kernel.get_plugin("devices")
+            devices_plugin.set_install_confirm(self._confirm_install)
+        except KeyError:
+            pass  # devices plugin not loaded — fine
+
+        # Banner uses asyncio.sleep / rich spinners — print it before the
+        # persistent app takes over the terminal.
         await self._render_startup()
 
-        # Build the persistent input application
         self._app = self._build_persistent_app()
-
-        # Start the processor coroutine that drains the input queue
         self._processor_task = asyncio.create_task(self._processor_loop())
 
-        # Run the application — blocks until /exit or Ctrl-D / EOF
         try:
             await self._app.run_async()
         except (EOFError, KeyboardInterrupt):
@@ -273,7 +227,7 @@ class CLIPlugin(AtlasPlugin):
                 self._processor_task.cancel()
                 try:
                     await self._processor_task
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, Exception):
                     pass
 
     async def unload(self) -> None:
@@ -287,24 +241,34 @@ class CLIPlugin(AtlasPlugin):
         self._console.print(text, style=style, end="\n")
 
     async def stream_reasoning(self, token: str) -> None:
+        """Stream thinking/reasoning tokens in dim grey.
+        Re-applies the dim ANSI on every chunk because rich's tool-call print
+        between rounds resets SGR — without this re-apply, the second round
+        of reasoning shows up in default color.
+
+        We deliberately don't `flush()` mid-line. patch_stdout flushes on
+        every newline naturally; forcing a flush mid-line leaves the cursor
+        mid-row and then the input frame redraws on top of the partial token,
+        which is what produced text-on-the-border artifacts."""
         if not self._showed_thinking_header:
-            self._console.print("[dim italic]✦ thinking[/dim italic]")
+            sys.stdout.write("\n\033[2m✦ thinking\n")
             self._showed_thinking_header = True
-        self._console.print(token, end="", highlight=False, soft_wrap=True)
+        sys.stdout.write("\033[2m" + token)
+        await asyncio.sleep(0)
 
     async def stream_token(self, token: str) -> None:
         if self._showed_thinking_header and not self._showed_response_header:
-            self._console.print()
-            self._console.print()
+            sys.stdout.write("\033[0m\n\n")
             self._showed_response_header = True
         self._response_buffer += token
-        self._console.print(token, end="", highlight=False)
-        # Yield to the event loop so patch_stdout's proxy actually flushes
-        # the token to the terminal before the next chunk arrives.
+        sys.stdout.write(token)
         await asyncio.sleep(0)
 
     async def show_tool_call(self, tool_name: str) -> None:
-        self._console.print(f"\n[dim]\\[calling: {tool_name}...][/dim]")
+        # Force any in-flight buffered tokens to settle as a newline-terminated
+        # line before the tool-call notification appears.
+        sys.stdout.write("\033[0m\n")
+        self._console.print(f"[dim]\\[calling: {tool_name}...][/dim]")
 
     # ── banners ────────────────────────────────────────────────────────────
 
@@ -352,7 +316,7 @@ class CLIPlugin(AtlasPlugin):
 
         self._console.print()
 
-    # ── framed input box ──────────────────────────────────────────────────
+    # ── persistent input box ──────────────────────────────────────────────
 
     def _toolbar_text(self):
         cfg = self._kernel.config.get("openrouter", {})
@@ -386,59 +350,59 @@ class CLIPlugin(AtlasPlugin):
             *tail,
         ]
 
-    def _on_accept(self, buffer):
-        """Called when the user hits Enter — push to queue, clear input, keep app alive."""
-        text = buffer.text
+    def _on_accept(self, buff) -> bool:
+        text = buff.text
         if text.strip():
             self._input_queue.put_nowait(text)
-        buffer.reset()
-        return False  # False keeps the app running
+        buff.reset()
+        return False  # keep the application running
 
     def _build_persistent_app(self) -> Application:
-        """Build the long-lived Application that owns the input box.
-        Multi-line: Enter submits, Alt+Enter inserts newline, Esc interrupts streaming."""
+        """Long-lived Application that owns the input box.
+        Stays mounted across turns so the prompt never disappears while
+        Atlas streams a response above it."""
         text_area = TextArea(
             multiline=True,
             wrap_lines=True,
-            completer=self._completer,
             history=self._history,
+            completer=self._completer,
             complete_while_typing=True,
-            scrollbar=False,
-            style="class:input",
-            prompt="◈ ",
             accept_handler=self._on_accept,
+            scrollbar=False,
+            prompt="◈ ",
             height=Dimension(min=1, max=8, preferred=1),
         )
         self._text_area = text_area
 
         kb = KeyBindings()
 
-        # Plain Enter → submit (multiline=True doesn't do this by default)
         @kb.add("enter")
         def _(event):
             event.current_buffer.validate_and_handle()
 
-        # Alt+Enter (sent as Escape+Enter on most terminals) → newline
         @kb.add("escape", "enter")
         def _(event):
-            text_area.buffer.insert_text("\n")
+            event.current_buffer.insert_text("\n")
 
-        # Esc alone → interrupt current LLM call. Don't use eager=True or
-        # Esc+Enter wouldn't match. prompt_toolkit waits briefly for the next key.
+        # Esc alone — interrupt streaming when one is in flight. Don't use
+        # eager=True or escape+enter would never match (ptk waits a beat for
+        # the next key).
         @kb.add("escape")
         def _(event):
-            if self._is_processing and self._current_process_task and not self._current_process_task.done():
+            if (
+                self._is_processing
+                and self._current_process_task
+                and not self._current_process_task.done()
+            ):
                 self._current_process_task.cancel()
-
-        @kb.add("c-d")
-        def _(event):
-            if not text_area.text:
-                self._running = False
-                event.app.exit()
 
         @kb.add("c-c")
         def _(event):
-            if self._is_processing and self._current_process_task and not self._current_process_task.done():
+            if (
+                self._is_processing
+                and self._current_process_task
+                and not self._current_process_task.done()
+            ):
                 self._current_process_task.cancel()
             elif text_area.text:
                 text_area.buffer.reset()
@@ -446,32 +410,155 @@ class CLIPlugin(AtlasPlugin):
                 self._running = False
                 event.app.exit()
 
-        framed = rounded_frame(text_area)
-        toolbar = Window(
-            FormattedTextControl(self._toolbar_text),
-            height=Dimension.exact(1),
-            style="class:toolbar",
-        )
+        @kb.add("c-d")
+        def _(event):
+            if not text_area.text:
+                self._running = False
+                event.app.exit()
 
-        # Wrap in FloatContainer so the completion dropdown can render above the frame
-        root = FloatContainer(
-            content=HSplit([framed, toolbar]),
-            floats=[
-                Float(
-                    xcursor=True,
-                    ycursor=True,
-                    content=CompletionsMenu(max_height=10, scroll_offset=1),
-                ),
-            ],
+        layout = Layout(
+            FloatContainer(
+                content=HSplit([
+                    Frame(body=text_area, style="class:frame"),
+                    Window(
+                        content=FormattedTextControl(self._toolbar_text),
+                        height=Dimension.exact(1),
+                        style="class:toolbar",
+                    ),
+                ]),
+                floats=[
+                    Float(
+                        xcursor=True,
+                        ycursor=True,
+                        content=CompletionsMenu(max_height=12, scroll_offset=2),
+                    )
+                ],
+            ),
+            focused_element=text_area,
         )
 
         return Application(
-            layout=Layout(root),
+            layout=layout,
             key_bindings=kb,
-            full_screen=False,
             style=INPUT_STYLE,
             mouse_support=False,
+            full_screen=False,
         )
+
+    # ── streaming helpers ─────────────────────────────────────────────────
+
+    async def _partial_flush_pump(self) -> None:
+        """Force-drain the StdoutProxy buffer every PARTIAL_FLUSH_INTERVAL.
+
+        StdoutProxy only auto-flushes on newline. For models that emit long
+        runs of text without newlines, the buffer can sit unrendered for the
+        full response. This pump nudges any partial-line content to the
+        terminal so the user sees progress.
+
+        Trade-off: each partial flush gets rendered as its own row (run_in_terminal
+        appends \\r\\n after each call), so a slow no-newline stream looks
+        slightly fragmented. Newline-terminated streams are unaffected because
+        the buffer is empty by the time the pump fires."""
+        try:
+            while self._is_processing:
+                await asyncio.sleep(PARTIAL_FLUSH_INTERVAL)
+                if not self._is_processing:
+                    break
+                try:
+                    sys.stdout.flush()
+                except Exception:
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    # ── processor (drains the input queue) ─────────────────────────────────
+
+    async def _processor_loop(self) -> None:
+        """Drain submitted inputs. While this runs, sys.stdout is wrapped in
+        a StdoutProxy so prints/streams appear above the persistent input
+        box. The proxy uses a 20ms flush cadence (vs the 200ms default) so
+        per-token streaming actually feels live for streaming-capable models."""
+        agent = self._kernel.get_plugin("agent")
+
+        proxy = StdoutProxy(sleep_between_writes=STREAMING_FLUSH_INTERVAL, raw=True)
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        sys.stdout = cast(TextIO, proxy)
+        sys.stderr = cast(TextIO, proxy)
+
+        try:
+            while self._running:
+                try:
+                    user_input = await asyncio.wait_for(
+                        self._input_queue.get(), timeout=0.5
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    break
+
+                self._console.print(f"\n[bold cyan]›[/bold cyan] {user_input}")
+
+                if user_input.startswith("/"):
+                    try:
+                        handled = await self._handle_command(user_input)
+                        if not handled:
+                            self._p("[dim red]unknown command. type /help[/dim red]")
+                    except Exception as e:
+                        self._p(f"[bold red]command error: {e}[/bold red]")
+                    continue
+
+                self._is_processing = True
+                if self._app:
+                    self._app.invalidate()  # refresh toolbar to show "thinking…"
+
+                self._showed_thinking_header = False
+                self._showed_response_header = False
+                self._response_buffer = ""
+                self._p()
+
+                flush_pump = asyncio.create_task(self._partial_flush_pump())
+
+                self._current_process_task = asyncio.create_task(
+                    agent.process(
+                        user_input,
+                        on_token=self.stream_token,
+                        on_tool_call=self.show_tool_call,
+                        on_reasoning=self.stream_reasoning,
+                    )
+                )
+                try:
+                    await self._current_process_task
+                except asyncio.CancelledError:
+                    # `\033[0m\n` ends any in-flight dim/partial line before
+                    # rich.print runs — without the trailing newline, partial
+                    # tokens stay buffered in the StdoutProxy.
+                    sys.stdout.write("\033[0m\n")
+                    self._p("[dim][interrupted][/dim]")
+                except Exception as e:
+                    sys.stdout.write("\033[0m\n")
+                    self._p(f"[dim red][error: {e}][/dim red]")
+                finally:
+                    self._is_processing = False
+                    self._current_process_task = None
+                    flush_pump.cancel()
+                    try:
+                        await flush_pump
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    if self._app:
+                        self._app.invalidate()
+
+                # Reset any lingering SGR and end on a blank line. The trailing
+                # \n triggers the proxy's newline-based flush, so we don't
+                # need an explicit flush() here (that would push partial-line
+                # content and confuse the input redraw).
+                sys.stdout.write("\033[0m\n")
+                self._p()
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            proxy.close()
 
     # ── command handling ───────────────────────────────────────────────────
 
@@ -488,7 +575,7 @@ class CLIPlugin(AtlasPlugin):
             return True
 
         if cmd == "/config":
-            # Suspend live rendering so the interactive sub-prompts can take stdin
+            # Sub-prompts need stdin — suspend live rendering.
             async with in_terminal():
                 await self._handle_config()
             return True
@@ -518,9 +605,13 @@ class CLIPlugin(AtlasPlugin):
                 self._kernel.config["openrouter"]["default_model"] = arg
                 self._p(f"[green]✓ model:[/green] {arg}")
             else:
-                # Interactive picker — needs stdin, suspend live rendering
                 async with in_terminal():
                     await self._pick_model_interactive()
+            return True
+
+        if cmd == "/devices":
+            async with in_terminal():
+                await self._handle_devices(arg)
             return True
 
         if cmd == "/sessions":
@@ -545,9 +636,8 @@ class CLIPlugin(AtlasPlugin):
             return True
 
         if cmd == "/clear":
-            # console.clear() conflicts with the persistent Application's render
-            # tracking and corrupts the input box width on next render. Use the
-            # Application's own renderer.clear() and a minimal banner reprint.
+            # Reach in to the renderer instead of console.clear() — clearing
+            # via rich corrupts the input-frame width on the next paint.
             if self._app and self._app.renderer:
                 self._app.renderer.clear()
             await self._render_banner_static()
@@ -606,6 +696,112 @@ class CLIPlugin(AtlasPlugin):
         self._save_config_key("openrouter", "default_model", model)
         self._kernel.config["openrouter"]["default_model"] = model
         self._p(f"[green]✓ model:[/green] {model}")
+
+    # ── /devices interactive ──────────────────────────────────────────────
+
+    async def _handle_devices(self, arg: str) -> None:
+        try:
+            devices = self._kernel.get_plugin("devices")
+        except KeyError:
+            self._p("[dim red]devices plugin is not loaded[/dim red]")
+            return
+
+        # `list` is the default if no sub-command was given.
+        sub = (arg or "list").strip().split(maxsplit=1)
+        action = sub[0].lower() if sub else "list"
+        rest = sub[1] if len(sub) > 1 else ""
+
+        if action in ("ls", "list"):
+            self._render_device_list(devices)
+            self._p()
+            self._p("[dim]/devices search <query>   · find an MCP server[/dim]")
+            self._p("[dim]/devices install         · pick one to install + mount[/dim]")
+            self._p("[dim]/devices unmount <name>  · disconnect a device[/dim]")
+            return
+
+        if action == "unmount":
+            name = rest.strip()
+            if not name:
+                name = (await self._simple_prompt("device name › ")).strip()
+            if not name:
+                return
+            try:
+                await devices.unmount(name)
+                self._p(f"[green]✓ unmounted {name}[/green]")
+            except Exception as e:
+                self._p(f"[red]✗ {e}[/red]")
+            return
+
+        if action == "search":
+            query = rest.strip() or (await self._simple_prompt("search MCP for › ")).strip()
+            if not query:
+                return
+            with self._console.status("[dim]searching MCP registries...[/dim]", spinner="dots"):
+                cands = await devices.search_mcp(query, limit=10)
+            if not cands:
+                self._p("[dim](no MCP servers matched)[/dim]")
+                return
+            self._render_candidates(cands)
+            return
+
+        if action == "install":
+            query = rest.strip() or (await self._simple_prompt("search MCP for › ")).strip()
+            if not query:
+                return
+            with self._console.status(f"[dim]searching for '{query}'...[/dim]", spinner="dots"):
+                cands = await devices.search_mcp(query, limit=10)
+            if not cands:
+                self._p("[dim](no MCP servers matched)[/dim]")
+                return
+            self._render_candidates(cands)
+            choice = (await self._simple_prompt("pick number (or b to cancel) › ")).strip().lower()
+            if not choice or choice == "b":
+                return
+            try:
+                idx = int(choice) - 1
+                if not (0 <= idx < len(cands)):
+                    raise ValueError
+            except ValueError:
+                self._p("[dim red]invalid number[/dim red]")
+                return
+            cand = cands[idx]
+            default_name = cand.name.split("/")[-1].replace("@", "").replace("server-", "")
+            name = (await self._simple_prompt(f"local device name [{default_name}] › ")).strip() or default_name
+            try:
+                record = await devices.install_and_mount_mcp(cand, device_name=name)
+                self._p(
+                    f"[green]✓ mounted {record.spec.name}[/green] "
+                    f"with {len(record.tool_names)} tools"
+                )
+            except Exception as e:
+                self._p(f"[red]✗ {e}[/red]")
+            return
+
+        self._p(f"[dim red]unknown /devices subcommand: {action}[/dim red]")
+
+    def _render_device_list(self, devices) -> None:
+        records = devices.list()
+        self._p()
+        if not records:
+            self._p("[dim](no devices mounted)[/dim]")
+            return
+        for r in records:
+            caps = ", ".join(r.spec.capabilities) or "—"
+            self._p(f"  [bold cyan]{r.spec.name}[/bold cyan] [dim]({r.spec.kind})[/dim]")
+            self._p(f"    [dim]capabilities:[/dim] {caps}")
+            self._p(f"    [dim]tools:[/dim] {', '.join(r.tool_names) or '(none)'}")
+
+    def _render_candidates(self, cands) -> None:
+        self._p()
+        for i, c in enumerate(cands, 1):
+            self._p(
+                f"  [bold cyan]{i:>2}[/bold cyan]  "
+                f"[bold]{c.name}[/bold] [dim]({c.source})[/dim]"
+            )
+            if c.description:
+                self._p(f"      [dim]{c.description}[/dim]")
+            self._p(f"      [dim]install: {c.install_command}[/dim]")
+        self._p()
 
     # ── /config interactive ────────────────────────────────────────────────
 
@@ -702,8 +898,6 @@ class CLIPlugin(AtlasPlugin):
             self._p()
 
     async def _manage_favorites(self) -> None:
-        """Edit the 3-slot list of favorite models."""
-        # Ensure we always work with a 3-slot list
         favs = list(self._get_favorite_models())
         while len(favs) < 3:
             favs.append("")
@@ -739,15 +933,13 @@ class CLIPlugin(AtlasPlugin):
             new_val = (await self._simple_prompt(f"{label} › ")).strip()
 
             if new_val == "":
-                # Empty input → clear the slot
                 favs[idx] = ""
                 self._p(f"[green]✓ slot {idx + 1} cleared[/green]")
             else:
                 favs[idx] = new_val
                 self._p(f"[green]✓ slot {idx + 1}:[/green] {new_val}")
 
-            # Persist immediately on each change
-            cleaned = [m for m in favs if m]  # don't store empty slots in toml
+            cleaned = [m for m in favs if m]
             self._save_config_key("openrouter", "favorite_models", cleaned)
             self._kernel.config.setdefault("openrouter", {})["favorite_models"] = cleaned
 
@@ -760,9 +952,18 @@ class CLIPlugin(AtlasPlugin):
             answer = (await self._simple_prompt("run this? (y/N) › ")).strip().lower()
         return answer in ("y", "yes")
 
+    async def _confirm_install(self, action: str, detail: str) -> bool:
+        """Approve an MCP install / mount step."""
+        async with in_terminal():
+            self._console.print()
+            self._console.print(f"[bold yellow]⚠  {action}[/bold yellow]")
+            for line in detail.splitlines():
+                self._console.print(f"  [bright_white]{line}[/bright_white]")
+            answer = (await self._simple_prompt("proceed? (y/N) › ")).strip().lower()
+        return answer in ("y", "yes")
+
     async def _simple_prompt(self, label: str, is_password: bool = False) -> str:
         """Quick non-framed prompt for /config sub-questions."""
-        from prompt_toolkit import PromptSession
         sess = PromptSession()
         try:
             return await sess.prompt_async(label, is_password=is_password)
@@ -777,7 +978,6 @@ class CLIPlugin(AtlasPlugin):
         self._p(f"[green]✓ closed editor[/green]")
 
     def _save_config_key(self, section: str, key: str, value) -> None:
-        """Persist a config value (str, list, bool, etc.) to config.toml."""
         if CONFIG_PATH.exists():
             with open(CONFIG_PATH, "rb") as f:
                 cfg = tomllib.load(f)
@@ -865,56 +1065,3 @@ class CLIPlugin(AtlasPlugin):
             }
         except Exception as e:
             return {"returncode": 1, "stdout": "", "stderr": str(e)}
-
-    # ── persistent processor loop ─────────────────────────────────────────
-
-    async def _processor_loop(self) -> None:
-        """Drains submitted inputs. All output goes through patch_stdout so
-        it prints above the framed input box. Tokens are written raw as they
-        arrive — the user sees real per-token streaming. When the response
-        finishes, the full markdown render is printed below the raw stream."""
-        agent = self._kernel.get_plugin("agent")
-
-        with patch_stdout(raw=True):
-            while self._running:
-                try:
-                    user_input = await asyncio.wait_for(
-                        self._input_queue.get(), timeout=0.5
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                except asyncio.CancelledError:
-                    break
-
-                self._console.print(f"\n[bold cyan]›[/bold cyan] {user_input}")
-
-                if user_input.startswith("/"):
-                    try:
-                        handled = await self._handle_command(user_input)
-                        if not handled:
-                            self._p("[dim red]unknown command. type /help[/dim red]")
-                    except Exception as e:
-                        self._p(f"[bold red]command error: {e}[/bold red]")
-                    continue
-
-                self._is_processing = True
-                self._showed_thinking_header = False
-                self._showed_response_header = False
-                self._response_buffer = ""
-                self._p()
-
-                try:
-                    await agent.process(
-                        user_input,
-                        on_token=self.stream_token,
-                        on_tool_call=self.show_tool_call,
-                        on_reasoning=self.stream_reasoning,
-                    )
-                except asyncio.CancelledError:
-                    self._p("[dim]\n[interrupted][/dim]")
-                except Exception as e:
-                    self._p(f"[dim red]\n[error: {e}][/dim red]")
-                finally:
-                    self._is_processing = False
-
-                self._p()

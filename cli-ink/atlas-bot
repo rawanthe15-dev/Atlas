@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Atlas Discord bot launcher — headless kernel that hosts the Discord channel.
+# First run installs node_modules; subsequent runs just exec.
+
+set -e
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
+if [ ! -d node_modules ]; then
+  echo "→ installing node_modules (first run)…"
+  npm install >/dev/null 2>&1
+fi
+
+exec npx tsx src/discord-bot.ts "$@"

@@ -25,3 +25,53 @@ max_session_history = 3
 [tools]
 shell_confirm = true
 brave_api_key = ""
+
+# ─── Devices ───────────────────────────────────────────────────────────────
+# Auto-mount entries are loaded at startup (in addition to anything the user
+# mounted at runtime, which lives under memory/devices/<name>.json).
+#
+# Examples:
+#
+#   [[devices.auto_mount]]
+#   name = "homeassistant"
+#   kind = "homeassistant"
+#   description = "My Home Assistant instance"
+#   [devices.auto_mount.config]
+#   url   = "http://homeassistant.local:8123"
+#   token = "..."
+#
+#   [[devices.auto_mount]]
+#   name = "tv"
+#   kind = "shell"
+#   description = "Living-room TV via IR blaster"
+#   [devices.auto_mount.config]
+#   commands = [
+#     { name = "on",  description = "Turn TV on",  template = "irsend SEND_ONCE livingroom KEY_POWER" },
+#     { name = "off", description = "Turn TV off", template = "irsend SEND_ONCE livingroom KEY_POWER" },
+#   ]
+#
+#   [[devices.auto_mount]]
+#   name = "fetch"
+#   kind = "mcp"
+#   description = "Reference MCP fetch server"
+#   [devices.auto_mount.config]
+#   transport = "stdio"
+#   command   = "uvx mcp-server-fetch"
+
+[devices]
+# install_policy:
+#   "auto"   — trusted sources install silently; unknown sources prompt once.
+#   "prompt" — every install / risky mount asks before running anything.
+#   "off"    — installs and code-running bridge mounts are refused entirely.
+install_policy = "auto"
+
+# Patterns that count as trusted under policy="auto".
+#   "<source>"           matches candidate.source exactly.
+#   "<source>:<glob>"    matches source AND fnmatches the candidate id.
+trusted_sources = [
+  "official",                              # the official MCP registry
+  "npm:@modelcontextprotocol/*",           # reference servers
+]
+
+# auto_mount = []  # populate with [[devices.auto_mount]] entries above
+
