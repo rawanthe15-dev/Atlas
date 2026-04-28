@@ -5,6 +5,8 @@ export interface ToolSchemaParameter {
   items?: ToolSchemaParameter;
   properties?: Record<string, ToolSchemaParameter>;
   required?: string[];
+  /** True | object — bridge tools and the http `request` tool use this. */
+  additionalProperties?: boolean | ToolSchemaParameter;
 }
 
 export interface ToolSchema {

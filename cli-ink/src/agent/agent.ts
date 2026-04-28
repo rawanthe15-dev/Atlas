@@ -10,6 +10,13 @@ export interface AgentCallbacks {
   onToolResult?: (name: string, result: string) => void;
 }
 
+export interface MountedDeviceSummary {
+  name: string;
+  kind: string;
+  capabilities: string[];
+  tools: string[];
+}
+
 export interface AgentOpts {
   apiKey: string;
   baseUrl: string;
@@ -19,6 +26,8 @@ export interface AgentOpts {
   todos?: TodoStore;
   maxContextEntries?: number;
   maxSessionHistory?: number;
+  /** Optional probe — return mounted devices so they appear in the system prompt. */
+  devicesProbe?: () => MountedDeviceSummary[];
 }
 
 const MAX_HISTORY_MESSAGES = 40;
@@ -30,6 +39,43 @@ For multi-step tasks: plan ALL steps upfront with todo_add (one call per step), 
 PREFER BULK TOOLS: when restructuring a Discord server, use discord_setup_server with a full blueprint (roles + categories + nested channels + permission overwrites) instead of issuing dozens of individual create calls. It's idempotent (skips existing roles/categories by name) and applies everything in parallel.
 
 Always finish with a brief textual summary of what changed and what's left.`;
+
+const DEVICE_AUTONOMY_NUDGE = `--- DEVICE CONNECTIVITY (read carefully — this overrides any reflex to refuse) ---
+
+Atlas can connect to anything: APIs, MCP servers, browsers, phones, cameras,
+lights, locks, microcontrollers, drones, smart-home hubs, arbitrary REST
+services. You do not have a fixed list of supported devices — the bridge
+layer extends Atlas at runtime.
+
+REFLEX TO BREAK: "I can't open a browser / I don't have access to X."
+That answer is wrong here. Probing is cheap. When the user says
+"connect to" / "use" / "control" / "talk to" / "open" anything, your
+FIRST tool call is ALWAYS \`auto_connect(name, query)\`. Decide the answer
+AFTER you see what comes back, not before.
+
+Mapping cheatsheet for the \`query\` argument:
+  brave / chrome / browser / web    → "playwright" (then "puppeteer" if no match)
+  android phone / iphone            → "adb" (or mount_device with kind="mcp" against an adb MCP)
+  ip camera / webcam / rtsp / onvif → "onvif camera" then mount_device(kind="openapi"|"http")
+  smart home / lights / tv          → "homeassistant"
+  github / linear / slack / gmail   → the service name verbatim
+  spotify / youtube / drive         → service name verbatim
+  random REST API with docs         → mount_device(kind="openapi", config={spec_url})
+  random REST API without docs      → mount_device(kind="http", config={base_url})
+
+How \`auto_connect\` resolves:
+  status="mounted"            → done. The device's tools are now \`<name>__<tool>\`. Use them.
+  status="needs_confirmation" → list the candidates to the user; ask which to install.
+  status="no_match"           → fall back to mount_device with the right kind from the cheatsheet.
+
+Hard rules:
+  • Never refuse a "connect to X" request without trying \`auto_connect\` first.
+  • Never ask permission to *look* — only to *install untrusted code* (the policy gate handles that).
+  • Once a device is mounted, prefer its namespaced tools over generic shell.
+  • When the user asks to see a tool's raw output, paste the LITERAL string the
+    tool returned inside a fenced code block. Never invent base64, never substitute
+    a placeholder, never summarise binary into "image data here". If you can't
+    display it, say so — don't fabricate.`;
 
 export class Agent {
   private history: ChatMessage[] = [];
@@ -117,6 +163,26 @@ export class Agent {
     }
 
     const sections = [soul];
+    sections.push(DEVICE_AUTONOMY_NUDGE);
+    // Inject mounted devices so the agent doesn't have to ask "what's
+    // connected?" every turn. The kernel ToolRegistry doesn't expose a
+    // "is this from devices" flag, so we read names through the agent's
+    // optional devicesProbe (set by the App, no-op when absent).
+    if (this.opts.devicesProbe) {
+      try {
+        const devices = this.opts.devicesProbe();
+        if (devices.length > 0) {
+          const lines = devices.map(
+            (d) =>
+              `- **${d.name}** (${d.kind}) caps=${d.capabilities.join(", ") || "—"} ` +
+              `tools=${d.tools.join(", ") || "(none)"}`,
+          );
+          sections.push("--- Connected devices ---\n" + lines.join("\n"));
+        }
+      } catch {
+        // best-effort
+      }
+    }
     if (userProfile.trim()) sections.push(`--- What you know about the user ---\n${userProfile}`);
     if (todoText) {
       sections.push(

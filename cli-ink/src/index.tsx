@@ -6,6 +6,7 @@ import { loadConfig } from "./config/config.js";
 import { Kernel } from "./kernel/kernel.js";
 import { MemoryPlugin } from "./plugins/memory-plugin.js";
 import { ToolsPlugin } from "./plugins/tools-plugin.js";
+import { DevicesPlugin } from "./plugins/devices-plugin.js";
 import { AgentPlugin } from "./plugins/agent-plugin.js";
 import { CorePlugin } from "./plugins/core-plugin.js";
 import { ConfigPlugin } from "./plugins/config-plugin.js";
@@ -41,7 +42,22 @@ async function main(): Promise<void> {
   await kernel.load(new OnboardingPlugin());
   await kernel.load(new MemoryPlugin());
   await kernel.load(new ToolsPlugin({ shellConfirm }));
+  // Device connectivity — must load BEFORE AgentPlugin so the agent's
+  // system prompt can probe for mounted devices on its first turn.
+  const devicesPlugin = new DevicesPlugin();
+  await kernel.load(devicesPlugin);
   await kernel.load(new AgentPlugin());
+
+  // Hand the agent a probe so mounted devices appear in its system prompt.
+  if (kernel.agent) {
+    (kernel.agent as any).opts.devicesProbe = () =>
+      devicesPlugin.list().map((r) => ({
+        name: r.spec.name,
+        kind: r.spec.kind,
+        capabilities: r.spec.capabilities,
+        tools: r.toolNames,
+      }));
+  }
 
   // Discord auto-loads when a token is present and not explicitly disabled.
   // It's lightweight (one websocket connection + event handlers) and shares

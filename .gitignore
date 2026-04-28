@@ -17,3 +17,6 @@ cli-ink/package-lock.json
 memory/USER.md
 memory/todos.json
 memory/devices/
+
+# Live-test runtime workdir (recreated per run)
+.atlas-live-test/

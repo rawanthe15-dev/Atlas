@@ -47,6 +47,11 @@ Hard rules:
   • Never refuse a "connect to X" request without trying `auto_connect` first.
   • Never ask the user for permission to *look* — only for permission to *install untrusted code* (the policy gate handles that automatically).
   • Once a device is mounted, prefer its namespaced tools over generic shell.
+  • When the user asks to see a tool's raw output (bytes, JSON, response body),
+    paste the LITERAL string the tool returned inside a fenced code block.
+    Never invent base64, never substitute a placeholder, never summarise
+    binary data into "image data here". If you can't display it, say so —
+    don't fabricate.
 """
 
 
@@ -141,6 +146,7 @@ class AgentPlugin(AtlasPlugin):
         on_token: Optional[Callable[[str], Union[None, Awaitable[None]]]] = None,
         on_tool_call: Optional[Callable[[str], Union[None, Awaitable[None]]]] = None,
         on_reasoning: Optional[Callable[[str], Union[None, Awaitable[None]]]] = None,
+        on_tool_result: Optional[Callable[[str, str], Union[None, Awaitable[None]]]] = None,
     ) -> str:
         system_prompt = await self._build_system_prompt(user_input)
         messages = [{"role": "system", "content": system_prompt}]
@@ -213,6 +219,11 @@ class AgentPlugin(AtlasPlugin):
                     "tool_call_id": tc["id"],
                     "content": tool_result,
                 })
+
+                if on_tool_result is not None:
+                    cb_ret = on_tool_result(tc["name"], tool_result)
+                    if asyncio.iscoroutine(cb_ret):
+                        await cb_ret
 
         # Persist to history and session
         self._history.append({"role": "user", "content": user_input})
